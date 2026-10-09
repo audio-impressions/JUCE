@@ -596,7 +596,7 @@ private:
                             const AudioDeviceManager::AudioDeviceSetup* preferredSetupOptions)
     {
         deviceManager.addAudioCallback (this);
-        deviceManager.addMidiInputDeviceCallback ({}, &player);
+        player.setMidiInputDeviceManager (&deviceManager);
 
         reloadAudioDeviceState (enableAudioInput, preferredDefaultDeviceName, preferredSetupOptions);
     }
@@ -605,7 +605,7 @@ private:
     {
         saveAudioDeviceState();
 
-        deviceManager.removeMidiInputDeviceCallback ({}, &player);
+        player.setMidiInputDeviceManager (nullptr);
         deviceManager.removeAudioCallback (this);
     }
 
