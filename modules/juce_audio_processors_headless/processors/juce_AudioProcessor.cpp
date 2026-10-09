@@ -589,7 +589,7 @@ void AudioProcessor::suspendProcessing (const bool shouldBeSuspended)
 void AudioProcessor::reset() {}
 
 template <typename floatType>
-void AudioProcessor::processBypassed (AudioBuffer<floatType>& buffer, MidiBuffer&)
+void AudioProcessor::processBypassed (AudioBuffer<floatType>& buffer)
 {
     // If you hit this assertion then your plug-in is reporting that it introduces
     // some latency, but you haven't overridden processBlockBypassed to produce
@@ -602,8 +602,10 @@ void AudioProcessor::processBypassed (AudioBuffer<floatType>& buffer, MidiBuffer
         buffer.clear (ch, 0, buffer.getNumSamples());
 }
 
-void AudioProcessor::processBlockBypassed (AudioBuffer<float>&  buffer, MidiBuffer& midi)    { processBypassed (buffer, midi); }
-void AudioProcessor::processBlockBypassed (AudioBuffer<double>& buffer, MidiBuffer& midi)    { processBypassed (buffer, midi); }
+void AudioProcessor::processBlockBypassed (AudioBuffer<float>&  buffer, MidiBuffer&)    { processBypassed (buffer); }
+void AudioProcessor::processBlockBypassed (AudioBuffer<double>& buffer, MidiBuffer&)    { processBypassed (buffer); }
+void AudioProcessor::processBlockBypassedUMP (AudioBuffer<float>&  buffer, UMPBuffer&)  { processBypassed (buffer); }
+void AudioProcessor::processBlockBypassedUMP (AudioBuffer<double>& buffer, UMPBuffer&)  { processBypassed (buffer); }
 
 void AudioProcessor::processBlock ([[maybe_unused]] AudioBuffer<double>& buffer,
                                    [[maybe_unused]] MidiBuffer& midiMessages)
@@ -612,6 +614,26 @@ void AudioProcessor::processBlock ([[maybe_unused]] AudioBuffer<double>& buffer,
     // precision version of processBlock on a processor which does not support it
     // (i.e. supportsDoublePrecisionProcessing() returns false), or the implementation
     // of the AudioProcessor forgot to override the double precision version of this method
+    jassertfalse;
+}
+
+void AudioProcessor::processBlockUMP ([[maybe_unused]] AudioBuffer<float>& buffer,
+                                      [[maybe_unused]] UMPBuffer& umpMessages)
+{
+    // If you hit this assertion then either the caller called processBlockUMP on a
+    // processor which does not support it (i.e. getMidiFormat() returns midiBuffer),
+    // or the implementation of the AudioProcessor forgot to override this method
+    jassertfalse;
+}
+
+void AudioProcessor::processBlockUMP ([[maybe_unused]] AudioBuffer<double>& buffer,
+                                      [[maybe_unused]] UMPBuffer& umpMessages)
+{
+    // If you hit this assertion then either the caller called the double precision
+    // version of processBlockUMP on a processor which does not support it
+    // (i.e. getMidiFormat() returns midiBuffer, or supportsDoublePrecisionProcessing()
+    // returns false), or the implementation of the AudioProcessor forgot to override
+    // the double precision version of this method
     jassertfalse;
 }
 

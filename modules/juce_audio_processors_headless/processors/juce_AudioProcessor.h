@@ -98,6 +98,17 @@ public:
         yes
     };
 
+    /** The formats in which a processor can receive MIDI.
+
+        @see getMidiFormat
+    */
+    enum class MidiFormat
+    {
+        midiBuffer,     /**< MIDI 1.0 bytestream messages in a MidiBuffer */
+        umpMidi1,       /**< Universal MIDI Packets in a UMPBuffer, using the MIDI 1.0 protocol */
+        umpMidi2        /**< Universal MIDI Packets in a UMPBuffer, using the MIDI 2.0 protocol */
+    };
+
     using ChangeDetails = AudioProcessorListener::ChangeDetails;
 
     //==============================================================================
@@ -315,6 +326,64 @@ public:
     */
     virtual void processBlockBypassed (AudioBuffer<double>& buffer,
                                        MidiBuffer& midiMessages);
+
+    /** Renders the next block, receiving MIDI as Universal MIDI Packets.
+
+        Apart from the type of its MIDI buffer, this works in the same way as the MidiBuffer
+        version, processBlock(). Each packet's sample position is its time as a number of
+        samples from the start of the block, every channel voice packet in the buffer uses
+        the protocol given by getMidiFormat(), and any packets left in the buffer when this
+        method has finished are assumed to be the processor's MIDI output.
+
+        Hosts must check getMidiFormat() before calling this, and only call it if it returns
+        umpMidi1 or umpMidi2. Hosts that don't support Universal MIDI Packets call
+        processBlock() instead, so you must still implement that method.
+
+        @see getMidiFormat, UMPBuffer
+    */
+    virtual void processBlockUMP (AudioBuffer<float>& buffer,
+                                  UMPBuffer& umpMessages);
+
+    /** Renders the next block, receiving MIDI as Universal MIDI Packets.
+
+        Apart from the type of its MIDI buffer, this works in the same way as the MidiBuffer
+        version, processBlock(). Each packet's sample position is its time as a number of
+        samples from the start of the block, every channel voice packet in the buffer uses
+        the protocol given by getMidiFormat(), and any packets left in the buffer when this
+        method has finished are assumed to be the processor's MIDI output.
+
+        Hosts must check getMidiFormat() before calling this, and only call it if it returns
+        umpMidi1 or umpMidi2. Hosts that don't support Universal MIDI Packets call
+        processBlock() instead, so you must still implement that method.
+
+        @see getMidiFormat, supportsDoublePrecisionProcessing, UMPBuffer
+    */
+    virtual void processBlockUMP (AudioBuffer<double>& buffer,
+                                  UMPBuffer& umpMessages);
+
+    /** Renders the next block when the processor is being bypassed, receiving MIDI as
+        Universal MIDI Packets.
+
+        Hosts call this instead of the MidiBuffer version, processBlockBypassed(), only if
+        getMidiFormat() returns umpMidi1 or umpMidi2. The default implementation of this
+        method will pass-through any incoming audio, but you may override it for the same
+        reasons as processBlockBypassed(), e.g. to add latency compensation to the data to
+        match the processor's latency characteristics.
+    */
+    virtual void processBlockBypassedUMP (AudioBuffer<float>& buffer,
+                                          UMPBuffer& umpMessages);
+
+    /** Renders the next block when the processor is being bypassed, receiving MIDI as
+        Universal MIDI Packets.
+
+        Hosts call this instead of the MidiBuffer version, processBlockBypassed(), only if
+        getMidiFormat() returns umpMidi1 or umpMidi2. The default implementation of this
+        method will pass-through any incoming audio, but you may override it for the same
+        reasons as processBlockBypassed(), e.g. to add latency compensation to the data to
+        match the processor's latency characteristics.
+    */
+    virtual void processBlockBypassedUMP (AudioBuffer<double>& buffer,
+                                          UMPBuffer& umpMessages);
 
 
     //==============================================================================
@@ -886,6 +955,21 @@ public:
         Ideally, just return a constant.
     */
     virtual bool isMidiEffect() const                           { return false; }
+
+    /** Returns the format in which this processor receives MIDI.
+
+        The default implementation returns midiBuffer. If you return umpMidi1 or umpMidi2
+        here then you must override processBlockUMP(), which hosts that support Universal
+        MIDI Packets will call instead of processBlock(), as they will call
+        processBlockBypassedUMP() instead of processBlockBypassed(). Hosts that don't
+        support Universal MIDI Packets will still call processBlock(), so you must implement
+        that too, and allocate whatever both versions need in your prepareToPlay method.
+
+        This must return the same value every time it is called.
+        This may be called by the audio thread, so this should be fast.
+        Ideally, just return a constant.
+    */
+    virtual MidiFormat getMidiFormat() const                    { return MidiFormat::midiBuffer; }
 
     //==============================================================================
     /** This returns a critical section that will automatically be locked while the host
@@ -1688,7 +1772,7 @@ private:
     void getNextBestLayout (const BusesLayout&, BusesLayout&) const;
 
     template <typename floatType>
-    void processBypassed (AudioBuffer<floatType>&, MidiBuffer&);
+    void processBypassed (AudioBuffer<floatType>&);
 
     friend class LADSPAPluginInstance;
 
