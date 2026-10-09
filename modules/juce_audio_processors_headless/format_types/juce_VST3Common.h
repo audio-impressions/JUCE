@@ -1566,6 +1566,7 @@ private:
 
             case Steinberg::Vst::Event::kNoteExpressionValueEvent:
             case Steinberg::Vst::Event::kNoteExpressionTextEvent:
+            case Steinberg::Vst::Event::kNoteExpressionIntValueEvent:
             case Steinberg::Vst::Event::kChordEvent:
             case Steinberg::Vst::Event::kScaleEvent:
                 return {};

@@ -636,6 +636,45 @@ public:
             }
         }
 
+        beginTest ("MidiEventList::toMidiBuffer ignores integer note expression events");
+        {
+            Steinberg::Vst::Event noteOn{};
+            noteOn.type = Steinberg::Vst::Event::kNoteOnEvent;
+            noteOn.noteOn.pitch = 60;
+            noteOn.noteOn.velocity = 1.0f;
+            noteOn.noteOn.noteId = 1;
+
+            Steinberg::Vst::Event noteExpression{};
+            noteExpression.type = Steinberg::Vst::Event::kNoteExpressionIntValueEvent;
+            noteExpression.sampleOffset = 10;
+            noteExpression.noteExpressionIntValue.noteId = 1;
+            noteExpression.noteExpressionIntValue.value = 1;
+
+            Steinberg::Vst::Event noteOff{};
+            noteOff.type = Steinberg::Vst::Event::kNoteOffEvent;
+            noteOff.sampleOffset = 20;
+            noteOff.noteOff.pitch = 60;
+            noteOff.noteOff.noteId = 1;
+
+            const auto toMidiBuffer = [] (std::vector<Steinberg::Vst::Event> events)
+            {
+                MidiEventList list;
+
+                for (auto& e : events)
+                    list.addEvent (e);
+
+                MidiBuffer result;
+                MidiEventList::toMidiBuffer (result, list);
+                return result;
+            };
+
+            const auto expected = toMidiBuffer ({ noteOn, noteOff });
+            const auto result = toMidiBuffer ({ noteOn, noteExpression, noteOff });
+
+            expectEquals (result.getNumEvents(), 2);
+            expect (result.data == expected.data);
+        }
+
         beginTest ("HostToClientParamQueue::append uses a node from storage");
         {
             HostToClientParamQueue::NodeStorage storage;
