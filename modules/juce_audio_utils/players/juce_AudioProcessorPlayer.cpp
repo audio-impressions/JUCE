@@ -103,6 +103,37 @@ static void initialiseIoBuffers (Span<const float* const> ins,
         zeromem (outs[i], numBytes);
 }
 
+static ump::PacketProtocol getPacketProtocol (AudioProcessor::MidiFormat format)
+{
+    return format == AudioProcessor::MidiFormat::umpMidi2 ? ump::PacketProtocol::MIDI_2_0
+                                                          : ump::PacketProtocol::MIDI_1_0;
+}
+
+template <typename FloatType>
+static void processBlockWithMidi (AudioProcessor& processor, AudioBuffer<FloatType>& buffer, MidiBuffer& midi)
+{
+    processor.processBlock (buffer, midi);
+}
+
+template <typename FloatType>
+static void processBlockWithMidi (AudioProcessor& processor, AudioBuffer<FloatType>& buffer, UMPBuffer& packets)
+{
+    processor.processBlockUMP (buffer, packets);
+}
+
+//==============================================================================
+void AudioProcessorPlayer::DeviceInput::consume (ump::Iterator b, ump::Iterator e, double time)
+{
+    for (const auto& packet : makeRange (b, e))
+    {
+        const auto isActiveSense = ump::Utils::getMessageType (packet[0]) == ump::Utils::MessageKind::commonRealtime
+                                   && ump::Utils::U8<1>::get (packet[0]) == 0xfe;
+
+        if (! isActiveSense)
+            collector.addPacketToQueue (packet, time);
+    }
+}
+
 //==============================================================================
 AudioProcessorPlayer::AudioProcessorPlayer (bool doDoublePrecisionProcessing)
     : isDoublePrecision (doDoublePrecisionProcessing)
@@ -111,6 +142,7 @@ AudioProcessorPlayer::AudioProcessorPlayer (bool doDoublePrecisionProcessing)
 
 AudioProcessorPlayer::~AudioProcessorPlayer()
 {
+    setMidiInputDeviceManager (nullptr);
     setProcessor (nullptr);
 }
 
@@ -151,8 +183,21 @@ void AudioProcessorPlayer::resizeChannels()
 
 void AudioProcessorPlayer::setProcessor (AudioProcessor* const processorToPlay)
 {
-    const ScopedLock sl (lock);
+    const auto format = [&]
+    {
+        const ScopedLock sl (lock);
+        prepareProcessor (processorToPlay);
+        return midiFormat;
+    }();
 
+    // The registration is moved without the lock, as moving it can wait for the MIDI inputs
+    moveMidiInputs (midiInputDeviceManager, format);
+}
+
+// Called with the lock held. Unlike setProcessor(), this never moves the registration with the
+// MIDI input device manager, so audioDeviceAboutToStart() can call it on any thread
+void AudioProcessorPlayer::prepareProcessor (AudioProcessor* const processorToPlay)
+{
     if (processor == processorToPlay)
         return;
 
@@ -178,6 +223,24 @@ void AudioProcessorPlayer::setProcessor (AudioProcessor* const processorToPlay)
                                                                 : AudioProcessor::singlePrecision);
 
         processorToPlay->prepareToPlay (sampleRate, blockSize);
+    }
+
+    const auto newFormat = processorToPlay != nullptr ? processorToPlay->getMidiFormat() : midiFormat;
+
+    if (newFormat != midiFormat)
+    {
+        midiFormat = newFormat;
+        const auto protocol = getPacketProtocol (midiFormat);
+        midiToPackets = ump::GenericUMPConverter { protocol };
+
+        // Packets in either protocol can be converted for a processor that uses a MidiBuffer, so the
+        // collector only starts again, discarding its packets, for a processor that needs the other one
+        if (midiFormat != AudioProcessor::MidiFormat::midiBuffer
+            && sampleRate > 0
+            && packetCollector.getProtocol() != protocol)
+        {
+            packetCollector.reset (sampleRate, protocol);
+        }
     }
 
     AudioProcessor* oldOne = nullptr;
@@ -224,6 +287,72 @@ void AudioProcessorPlayer::setMidiOutput (MidiOutput* midiOutputToUse)
     }
 }
 
+void AudioProcessorPlayer::setMidiInputDeviceManager (AudioDeviceManager* managerToUse)
+{
+    const auto format = [&]
+    {
+        const ScopedLock sl (lock);
+        return midiFormat;
+    }();
+
+    moveMidiInputs (managerToUse, format);
+}
+
+// Message thread only. The new registration is added before the old one is removed, so a message
+// that arrives in between may reach the processor twice, but can't be missed
+void AudioProcessorPlayer::moveMidiInputs (AudioDeviceManager* manager, AudioProcessor::MidiFormat format)
+{
+    if (manager == midiInputDeviceManager && (manager == nullptr || format == midiInputFormat))
+        return;
+
+    JUCE_ASSERT_MESSAGE_THREAD
+
+    if (manager != nullptr)
+        addMidiInputs (*manager, format);
+
+    if (midiInputDeviceManager != nullptr)
+        removeMidiInputs (*midiInputDeviceManager, midiInputFormat);
+
+    midiInputDeviceManager = manager;
+    midiInputFormat = format;
+}
+
+void AudioProcessorPlayer::addMidiInputs (AudioDeviceManager& manager, AudioProcessor::MidiFormat format)
+{
+    switch (format)
+    {
+        case AudioProcessor::MidiFormat::midiBuffer:
+            manager.addMidiInputDeviceCallback ({}, &messageCollector);
+            return;
+
+        case AudioProcessor::MidiFormat::umpMidi1:
+            manager.addMidiInputDeviceConsumer ({}, midi1Input, ump::PacketProtocol::MIDI_1_0);
+            return;
+
+        case AudioProcessor::MidiFormat::umpMidi2:
+            manager.addMidiInputDeviceConsumer ({}, midi2Input, ump::PacketProtocol::MIDI_2_0);
+            return;
+    }
+}
+
+void AudioProcessorPlayer::removeMidiInputs (AudioDeviceManager& manager, AudioProcessor::MidiFormat format)
+{
+    switch (format)
+    {
+        case AudioProcessor::MidiFormat::midiBuffer:
+            manager.removeMidiInputDeviceCallback ({}, &messageCollector);
+            return;
+
+        case AudioProcessor::MidiFormat::umpMidi1:
+            manager.removeMidiInputDeviceConsumer ({}, midi1Input);
+            return;
+
+        case AudioProcessor::MidiFormat::umpMidi2:
+            manager.removeMidiInputDeviceConsumer ({}, midi2Input);
+            return;
+    }
+}
+
 //==============================================================================
 void AudioProcessorPlayer::audioDeviceIOCallbackWithContext (const float* const* const inputChannelData,
                                                              const int numInputChannels,
@@ -239,8 +368,18 @@ void AudioProcessorPlayer::audioDeviceIOCallbackWithContext (const float* const*
     // These should have been prepared by audioDeviceAboutToStart()...
     jassert (sampleRate > 0 && blockSize > 0);
 
+    // Both collectors are emptied every block, as they time their contents from these calls
     incomingMidi.clear();
     messageCollector.removeNextBlockOfMessages (incomingMidi, numSamples);
+    incomingPackets.clear();
+    packetCollector.removeNextBlockOfPackets (incomingPackets, numSamples);
+
+    // Each stream is converted only if it doesn't match the processor's format, and packets only
+    // reach a processor that uses a MidiBuffer while the registration with the manager moves
+    if (midiFormat == AudioProcessor::MidiFormat::midiBuffer)
+        incomingPackets.addToMidiBuffer (incomingMidi, packetsToMidi);
+    else
+        incomingPackets.addFromMidiBuffer (incomingMidi, midiToPackets);
 
     initialiseIoBuffers ({ inputChannelData,  (size_t) numInputChannels },
                          { outputChannelData, (size_t) numOutputChannels },
@@ -308,30 +447,38 @@ void AudioProcessorPlayer::audioDeviceIOCallbackWithContext (const float* const*
 
         if (! processor->isSuspended())
         {
-            if (processor->isUsingDoublePrecision())
+            const auto processAndSendMidi = [&] (auto& midi)
             {
-                conversionBuffer.makeCopyOf (buffer, true);
-                processor->processBlock (conversionBuffer, incomingMidi);
-                buffer.makeCopyOf (conversionBuffer, true);
-            }
-            else
-            {
-                processor->processBlock (buffer, incomingMidi);
-            }
-
-            if (midiOutput != nullptr)
-            {
-                if (midiOutput->isBackgroundThreadRunning())
+                if (processor->isUsingDoublePrecision())
                 {
-                    midiOutput->sendBlockOfMessages (incomingMidi,
-                                                     Time::getMillisecondCounter(),
-                                                     sampleRate);
+                    conversionBuffer.makeCopyOf (buffer, true);
+                    processBlockWithMidi (*processor, conversionBuffer, midi);
+                    buffer.makeCopyOf (conversionBuffer, true);
                 }
                 else
                 {
-                    midiOutput->sendBlockOfMessagesNow (incomingMidi);
+                    processBlockWithMidi (*processor, buffer, midi);
                 }
-            }
+
+                if (midiOutput != nullptr)
+                {
+                    if (midiOutput->isBackgroundThreadRunning())
+                    {
+                        midiOutput->sendBlockOfMessages (midi,
+                                                         Time::getMillisecondCounter(),
+                                                         sampleRate);
+                    }
+                    else
+                    {
+                        midiOutput->sendBlockOfMessagesNow (midi);
+                    }
+                }
+            };
+
+            if (midiFormat == AudioProcessor::MidiFormat::midiBuffer)
+                processAndSendMidi (incomingMidi);
+            else
+                processAndSendMidi (incomingPackets);
 
             return;
         }
@@ -358,6 +505,12 @@ void AudioProcessorPlayer::audioDeviceAboutToStart (AudioIODevice* const device)
     resizeChannels();
 
     messageCollector.reset (sampleRate);
+    packetCollector.reset (sampleRate, getPacketProtocol (midiFormat));
+    packetCollector.ensureStorageAllocated (2048);
+    incomingMidi.ensureSize (2048);
+    incomingPackets.ensureSize (2048);
+    midiToPackets.reset();
+    packetsToMidi.reset();
 
     currentWorkgroup.reset();
 
@@ -367,8 +520,8 @@ void AudioProcessorPlayer::audioDeviceAboutToStart (AudioIODevice* const device)
             processor->releaseResources();
 
         auto* oldProcessor = processor;
-        setProcessor (nullptr);
-        setProcessor (oldProcessor);
+        prepareProcessor (nullptr);
+        prepareProcessor (oldProcessor);
     }
 }
 
@@ -404,6 +557,87 @@ struct AudioProcessorPlayerTests final : public UnitTest
         int numIns, numOuts;
     };
 
+    using MidiFormat = AudioProcessor::MidiFormat;
+
+    // Stands in for an audio device, so that the tests can call the player's audio callback
+    struct TestDevice final : public AudioIODevice
+    {
+        TestDevice() : AudioIODevice ("Test", "Test") {}
+
+        StringArray getOutputChannelNames() override                                { return { "L", "R" }; }
+        StringArray getInputChannelNames() override                                 { return {}; }
+        Array<double> getAvailableSampleRates() override                            { return { sampleRate }; }
+        Array<int> getAvailableBufferSizes() override                               { return { blockSize }; }
+        int getDefaultBufferSize() override                                         { return blockSize; }
+        String open (const BigInteger&, const BigInteger&, double, int) override    { return {}; }
+        void close() override                                                       {}
+        bool isOpen() override                                                      { return true; }
+        void start (AudioIODeviceCallback*) override                                {}
+        void stop() override                                                        {}
+        bool isPlaying() override                                                   { return true; }
+        String getLastError() override                                              { return {}; }
+        int getCurrentBufferSizeSamples() override                                  { return blockSize; }
+        double getCurrentSampleRate() override                                      { return sampleRate; }
+        int getCurrentBitDepth() override                                           { return 32; }
+        BigInteger getActiveOutputChannels() const override                         { return BigInteger (3); }
+        BigInteger getActiveInputChannels() const override                          { return {}; }
+        int getOutputLatencyInSamples() override                                    { return 0; }
+        int getInputLatencyInSamples() override                                     { return 0; }
+
+        // Long blocks let the collectors keep messages that are timestamped well in the past,
+        // however slowly the test runs
+        static constexpr double sampleRate = 48000.0;
+        static constexpr int blockSize = 48000;
+    };
+
+    // Records the MIDI that it receives, in the format that it's created with
+    struct MidiRecorder final : public AudioProcessor
+    {
+        explicit MidiRecorder (MidiFormat formatToUse)
+            : AudioProcessor (BusesProperties().withOutput ("Output", AudioChannelSet::stereo())),
+              recordedFormat (formatToUse)
+        {
+        }
+
+        using AudioProcessor::processBlock;
+        using AudioProcessor::processBlockUMP;
+
+        void processBlock (AudioBuffer<float>&, MidiBuffer& midiMessages) override
+        {
+            recordedMidi.addEvents (midiMessages, 0, -1, 0);
+            midiStorage.push_back (midiMessages.data.begin());
+        }
+
+        void processBlockUMP (AudioBuffer<float>&, UMPBuffer& umpMessages) override
+        {
+            recordedPackets.addPackets (umpMessages, 0, -1, 0);
+            packetStorage.push_back (umpMessages.data.begin());
+        }
+
+        MidiFormat getMidiFormat() const override                     { return recordedFormat; }
+        const String getName() const override                         { return "MidiRecorder"; }
+        void prepareToPlay (double, int) override                     {}
+        void releaseResources() override                              {}
+        double getTailLengthSeconds() const override                  { return 0.0; }
+        bool acceptsMidi() const override                             { return true; }
+        bool producesMidi() const override                            { return false; }
+        AudioProcessorEditor* createEditor() override                 { return nullptr; }
+        bool hasEditor() const override                               { return false; }
+        int getNumPrograms() override                                 { return 1; }
+        int getCurrentProgram() override                              { return 0; }
+        void setCurrentProgram (int) override                         {}
+        const String getProgramName (int) override                    { return {}; }
+        void changeProgramName (int, const String&) override          {}
+        void getStateInformation (MemoryBlock&) override              {}
+        void setStateInformation (const void*, int) override          {}
+
+        const MidiFormat recordedFormat;
+        MidiBuffer recordedMidi;
+        UMPBuffer recordedPackets;
+        std::vector<const uint8*> midiStorage;
+        std::vector<const uint32_t*> packetStorage;
+    };
+
     AudioProcessorPlayerTests()
         : UnitTest ("AudioProcessorPlayer", UnitTestCategories::audio) {}
 
@@ -429,6 +663,301 @@ struct AudioProcessorPlayerTests final : public UnitTest
             {
                 for (const auto& systemLayout : systemLayouts)
                     runTest (systemLayout, processorLayout);
+            }
+        }
+
+        beginTest ("A processor that uses a MidiBuffer receives injected messages as before");
+        {
+            MidiRecorder recorder { MidiFormat::midiBuffer };
+            TestDevice device;
+            AudioProcessorPlayer player;
+            player.setProcessor (&recorder);
+            player.audioDeviceAboutToStart (&device);
+
+            const auto messages = getTestMessages (60);
+            addMessages (player.getMidiMessageCollector(), messages);
+            processNextBlock (player);
+
+            expectEquals (recorder.recordedMidi.getNumEvents(), (int) messages.size());
+            expect (recorder.recordedMidi.data == getExpectedMidi (messages).data);
+            expect (recorder.recordedPackets.isEmpty());
+
+            player.audioDeviceStopped();
+            player.setProcessor (nullptr);
+        }
+
+        for (const auto format : { MidiFormat::umpMidi1, MidiFormat::umpMidi2 })
+        {
+            const auto isMidi2 = format == MidiFormat::umpMidi2;
+
+            beginTest (String ("A processor that uses MIDI ") + (isMidi2 ? "2.0" : "1.0")
+                       + " packets receives injected messages in that protocol");
+            {
+                MidiRecorder recorder { format };
+                TestDevice device;
+                AudioProcessorPlayer player;
+                player.setProcessor (&recorder);
+                player.audioDeviceAboutToStart (&device);
+
+                const auto messages = getTestMessages (60);
+                addMessages (player.getMidiMessageCollector(), messages);
+                processNextBlock (player);
+
+                expectEquals (recorder.recordedPackets.getNumPackets(), (int) messages.size());
+                expect (recorder.recordedPackets.data == getExpectedPackets (messages, format).data);
+                expect (recorder.recordedMidi.isEmpty());
+
+                if (! recorder.recordedPackets.isEmpty())
+                {
+                    const auto noteOn = (*recorder.recordedPackets.begin()).packet;
+                    const auto expectedKind = isMidi2 ? ump::Utils::MessageKind::channelVoice2
+                                                      : ump::Utils::MessageKind::channelVoice1;
+                    expect (ump::Utils::getMessageType (noteOn[0]) == expectedKind);
+                }
+
+                player.audioDeviceStopped();
+                player.setProcessor (nullptr);
+            }
+        }
+
+        beginTest ("A processor that replaces one of another format keeps receiving messages");
+        {
+            ScopedJuceInitialiser_GUI libraryInitialiser;
+            AudioDeviceManager manager;
+
+            MidiRecorder first { MidiFormat::midiBuffer },
+                         second { MidiFormat::umpMidi2 },
+                         third { MidiFormat::umpMidi1 },
+                         fourth { MidiFormat::midiBuffer };
+
+            TestDevice device;
+            AudioProcessorPlayer player;
+            player.setMidiInputDeviceManager (&manager);
+            player.audioDeviceAboutToStart (&device);
+
+            const auto play = [&] (MidiRecorder& recorder, int noteNumber)
+            {
+                player.setProcessor (&recorder);
+                const auto messages = getTestMessages (noteNumber);
+                addMessages (player.getMidiMessageCollector(), messages);
+                processNextBlock (player);
+                return messages;
+            };
+
+            const auto firstMessages  = play (first, 60);
+            const auto secondMessages = play (second, 61);
+            const auto thirdMessages  = play (third, 62);
+            const auto fourthMessages = play (fourth, 63);
+
+            expectEquals (first.recordedMidi.getNumEvents(), (int) firstMessages.size());
+            expectEquals (second.recordedPackets.getNumPackets(), (int) secondMessages.size());
+            expectEquals (third.recordedPackets.getNumPackets(), (int) thirdMessages.size());
+            expectEquals (fourth.recordedMidi.getNumEvents(), (int) fourthMessages.size());
+
+            expect (first.recordedMidi.data == getExpectedMidi (firstMessages).data);
+            expect (second.recordedPackets.data == getExpectedPackets (secondMessages, MidiFormat::umpMidi2).data);
+            expect (third.recordedPackets.data == getExpectedPackets (thirdMessages, MidiFormat::umpMidi1).data);
+            expect (fourth.recordedMidi.data == getExpectedMidi (fourthMessages).data);
+
+            player.audioDeviceStopped();
+            player.setProcessor (nullptr);
+            player.setMidiInputDeviceManager (nullptr);
+        }
+
+        beginTest ("The registration with the manager follows the processor's format");
+        {
+            ScopedJuceInitialiser_GUI libraryInitialiser;
+            AudioDeviceManager manager;
+
+            MidiRecorder midi2 { MidiFormat::umpMidi2 },
+                         midi1 { MidiFormat::umpMidi1 },
+                         legacy { MidiFormat::midiBuffer };
+
+            TestDevice device;
+            AudioProcessorPlayer player;
+            player.audioDeviceAboutToStart (&device);
+            player.setMidiInputDeviceManager (&manager);
+
+            expect (player.midiInputDeviceManager == &manager);
+            expect (player.midiInputFormat == MidiFormat::midiBuffer);
+
+            for (auto* recorder : { &midi2, &midi1, &legacy, &midi1 })
+            {
+                player.setProcessor (recorder);
+                expect (player.midiInputFormat == recorder->getMidiFormat());
+
+                player.audioDeviceAboutToStart (&device);
+                expect (player.midiInputFormat == recorder->getMidiFormat());
+            }
+
+            player.setProcessor (nullptr);
+            expect (player.midiInputFormat == MidiFormat::umpMidi1);
+
+            player.audioDeviceStopped();
+            player.setMidiInputDeviceManager (nullptr);
+            expect (player.midiInputDeviceManager == nullptr);
+        }
+
+        const auto none = ump::Factory::NoteAttributeKind::none;
+        const auto pitch = ump::Factory::NoteAttributeKind::pitch7_9;
+
+        const auto midi1Words = makeWords (ump::Factory::makeNoteOnV1 (0, 1, 60, 100),
+                                           ump::Factory::makeControlChangeV1 (0, 1, 74, 90),
+                                           ump::Factory::makeNoteOffV1 (0, 1, 60, 64));
+
+        const auto midi2Words = makeWords (ump::Factory::makeNoteOnV2 (0, 1, 60, pitch, 0x1234, 0x5678),
+                                           ump::Factory::makeControlChangeV2 (0, 1, 74, 0x89abcdef),
+                                           ump::Factory::makeNoteOffV2 (0, 1, 60, none, 0x4321, 0));
+
+        beginTest ("Packets from the manager in the processor's protocol reach it unchanged");
+        {
+            expect (getWords (receiveFromManager (MidiFormat::umpMidi1, midi1Words)) == midi1Words);
+            expect (getWords (receiveFromManager (MidiFormat::umpMidi2, midi2Words)) == midi2Words);
+        }
+
+        beginTest ("Active sense from the manager isn't passed to the processor");
+        {
+            const auto activeSense = ump::Factory::makeActiveSensing (0);
+            const auto noteOn1 = ump::Factory::makeNoteOnV1 (0, 0, 60, 100);
+            const auto noteOn2 = ump::Factory::makeNoteOnV2 (0, 0, 60, none, 0x8000, 0);
+
+            expect (getWords (receiveFromManager (MidiFormat::umpMidi1, makeWords (activeSense, noteOn1, activeSense)))
+                    == makeWords (noteOn1));
+            expect (getWords (receiveFromManager (MidiFormat::umpMidi2, makeWords (activeSense, noteOn2, activeSense)))
+                    == makeWords (noteOn2));
+        }
+
+        beginTest ("MIDI 1.0 packets from a device that can't provide MIDI 2.0 are translated once");
+        {
+            std::vector<uint32_t> expected;
+            ump::GenericUMPConverter converter { ump::PacketProtocol::MIDI_2_0 };
+            converter.convert (ump::Iterator (midi1Words.data(), midi1Words.size()),
+                               ump::Iterator (midi1Words.data() + midi1Words.size(), 0),
+                               [&] (const ump::View& packet)
+                               {
+                                   expected.insert (expected.end(), packet.begin(), packet.end());
+                               });
+
+            const auto received = receiveFromManager (MidiFormat::umpMidi2, midi1Words);
+            expectEquals (received.getNumPackets(), 3);
+            expect (getWords (received) == expected);
+        }
+
+        beginTest ("Messages waiting when a processor is replaced reach the next one");
+        {
+            MidiRecorder legacy { MidiFormat::midiBuffer },
+                         midi2 { MidiFormat::umpMidi2 },
+                         legacyAgain { MidiFormat::midiBuffer };
+
+            TestDevice device;
+            AudioProcessorPlayer player;
+            player.setProcessor (&legacy);
+            player.audioDeviceAboutToStart (&device);
+
+            const auto messages = getTestMessages (60);
+            addMessages (player.getMidiMessageCollector(), messages);
+            player.setProcessor (&midi2);
+            processNextBlock (player);
+
+            expect (legacy.recordedMidi.isEmpty());
+            expectEquals (midi2.recordedPackets.getNumPackets(), (int) messages.size());
+            expect (midi2.recordedPackets.data == getExpectedPackets (messages, MidiFormat::umpMidi2).data);
+
+            consume (player.midi2Input, midi2Words);
+            player.setProcessor (&legacyAgain);
+            processNextBlock (player);
+
+            MidiBuffer expected;
+            ump::ToBytestreamConverter converter { 64 };
+            makeBuffer (midi2Words).addToMidiBuffer (expected, converter);
+
+            expectEquals (legacyAgain.recordedMidi.getNumEvents(), 3);
+            expect (legacyAgain.recordedMidi.data == expected.data);
+
+            player.audioDeviceStopped();
+            player.setProcessor (nullptr);
+        }
+
+        beginTest ("Packets waiting when a processor changes between MIDI 1.0 and MIDI 2.0 packets are discarded");
+        {
+            MidiRecorder midi2 { MidiFormat::umpMidi2 },
+                         midi1 { MidiFormat::umpMidi1 },
+                         midi2Again { MidiFormat::umpMidi2 };
+
+            TestDevice device;
+            AudioProcessorPlayer player;
+            player.setProcessor (&midi2);
+            player.audioDeviceAboutToStart (&device);
+
+            consume (player.midi2Input, midi2Words);
+            player.setProcessor (&midi1);
+            processNextBlock (player);
+            expect (midi1.recordedPackets.isEmpty());
+
+            consume (player.midi1Input, midi1Words);
+            player.setProcessor (&midi2Again);
+            processNextBlock (player);
+            expect (midi2Again.recordedPackets.isEmpty());
+
+            consume (player.midi2Input, midi2Words);
+            processNextBlock (player);
+            expect (getWords (midi2Again.recordedPackets) == midi2Words);
+
+            player.audioDeviceStopped();
+            player.setProcessor (nullptr);
+        }
+
+        beginTest ("The buffers passed to a processor keep the storage that they had when the device started");
+        {
+            for (const auto format : { MidiFormat::midiBuffer, MidiFormat::umpMidi2 })
+            {
+                MidiRecorder recorder { format };
+                TestDevice device;
+                AudioProcessorPlayer player;
+                player.setProcessor (&recorder);
+                player.audioDeviceAboutToStart (&device);
+
+                const auto* midiStorage = player.incomingMidi.data.begin();
+                const auto* packetStorage = player.incomingPackets.data.begin();
+                expect (midiStorage != nullptr && packetStorage != nullptr);
+
+                auto numSent = 0;
+
+                // Each block holds more than the one before, so a buffer that grows as needed would move
+                for (const auto numCopies : { 1, 4, 20 })
+                {
+                    for (auto i = 0; i < numCopies; ++i)
+                    {
+                        const auto messages = getTestMessages (60 + i);
+                        addMessages (player.getMidiMessageCollector(), messages);
+                        numSent += (int) messages.size();
+                    }
+
+                    processNextBlock (player);
+                }
+
+                const auto isStorage = [] (const auto& pointers, const auto* storage)
+                {
+                    return pointers.size() == 3
+                           && std::all_of (pointers.begin(), pointers.end(), [&] (auto p) { return p == storage; });
+                };
+
+                if (format == MidiFormat::midiBuffer)
+                {
+                    expectEquals (recorder.recordedMidi.getNumEvents(), numSent);
+                    expect (isStorage (recorder.midiStorage, midiStorage));
+                }
+                else
+                {
+                    expectEquals (recorder.recordedPackets.getNumPackets(), numSent);
+                    expect (isStorage (recorder.packetStorage, packetStorage));
+                }
+
+                expect (player.incomingMidi.data.begin() == midiStorage);
+                expect (player.incomingPackets.data.begin() == packetStorage);
+
+                player.audioDeviceStopped();
+                player.setProcessor (nullptr);
             }
         }
     }
@@ -481,6 +1010,114 @@ struct AudioProcessorPlayerTests final : public UnitTest
             FloatVectorOperations::fill (result.getWritePointer (i), (float) i + 1, result.getNumSamples());
 
         return result;
+    }
+
+    // The messages are timestamped well before the next block, so that the collectors put them
+    // all at its start, whatever the timing of the test
+    static std::vector<MidiMessage> getTestMessages (int noteNumber)
+    {
+        const uint8 sysEx[] { 0x7e, 0x7f, 0x09, 0x01 };
+
+        std::vector<MidiMessage> result { MidiMessage::noteOn (1, noteNumber, (uint8) 100),
+                                          MidiMessage::controllerEvent (2, 7, 90),
+                                          MidiMessage::pitchWheel (3, 10000),
+                                          MidiMessage::createSysExMessage (sysEx, (int) std::size (sysEx)),
+                                          MidiMessage::noteOff (1, noteNumber, (uint8) 64) };
+
+        const auto time = Time::getMillisecondCounterHiRes() * 0.001 - 10.0;
+
+        for (auto& message : result)
+            message.setTimeStamp (time);
+
+        return result;
+    }
+
+    static void addMessages (MidiMessageCollector& collector, const std::vector<MidiMessage>& messages)
+    {
+        for (const auto& message : messages)
+            collector.addMessageToQueue (message);
+    }
+
+    // Returns the block that a MidiMessageCollector makes from the messages on its own
+    static MidiBuffer getExpectedMidi (const std::vector<MidiMessage>& messages)
+    {
+        MidiMessageCollector collector;
+        collector.reset (TestDevice::sampleRate);
+        addMessages (collector, messages);
+
+        MidiBuffer result;
+        collector.removeNextBlockOfMessages (result, TestDevice::blockSize);
+        return result;
+    }
+
+    static UMPBuffer getExpectedPackets (const std::vector<MidiMessage>& messages, MidiFormat format)
+    {
+        ump::GenericUMPConverter converter { format == MidiFormat::umpMidi2 ? ump::PacketProtocol::MIDI_2_0
+                                                                           : ump::PacketProtocol::MIDI_1_0 };
+        UMPBuffer result;
+        result.addFromMidiBuffer (getExpectedMidi (messages), converter);
+        return result;
+    }
+
+    static void consume (ump::Consumer& consumer, const std::vector<uint32_t>& words)
+    {
+        consumer.consume (ump::Iterator (words.data(), words.size()),
+                          ump::Iterator (words.data() + words.size(), 0),
+                          Time::getMillisecondCounterHiRes() * 0.001 - 10.0);
+    }
+
+    // Passes the words to the player in the way that the manager would for a processor of the
+    // given format, and returns the packets that reach the processor in the next block
+    static UMPBuffer receiveFromManager (MidiFormat format, const std::vector<uint32_t>& words)
+    {
+        MidiRecorder recorder { format };
+        TestDevice device;
+        AudioProcessorPlayer player;
+        player.setProcessor (&recorder);
+        player.audioDeviceAboutToStart (&device);
+
+        consume (format == MidiFormat::umpMidi2 ? player.midi2Input : player.midi1Input, words);
+        processNextBlock (player);
+
+        player.audioDeviceStopped();
+        player.setProcessor (nullptr);
+        return recorder.recordedPackets;
+    }
+
+    static UMPBuffer makeBuffer (const std::vector<uint32_t>& words)
+    {
+        UMPBuffer result;
+
+        for (const auto& packet : makeRange (ump::Iterator (words.data(), words.size()),
+                                             ump::Iterator (words.data() + words.size(), 0)))
+            result.addPacket (packet, 0);
+
+        return result;
+    }
+
+    static std::vector<uint32_t> getWords (const UMPBuffer& buffer)
+    {
+        std::vector<uint32_t> words;
+
+        for (const auto metadata : buffer)
+            words.insert (words.end(), metadata.packet.begin(), metadata.packet.end());
+
+        return words;
+    }
+
+    template <typename... Packets>
+    static std::vector<uint32_t> makeWords (const Packets&... packets)
+    {
+        std::vector<uint32_t> words;
+        (words.insert (words.end(), packets.begin(), packets.end()), ...);
+        return words;
+    }
+
+    static void processNextBlock (AudioProcessorPlayer& player)
+    {
+        AudioBuffer<float> outputs (2, TestDevice::blockSize);
+        player.audioDeviceIOCallbackWithContext (nullptr, 0, outputs.getArrayOfWritePointers(), 2,
+                                                 TestDevice::blockSize, {});
     }
 };
 

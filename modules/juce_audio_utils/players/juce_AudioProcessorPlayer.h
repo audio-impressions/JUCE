@@ -43,8 +43,10 @@ namespace juce
     give it a processor to use by calling setProcessor().
 
     It's also a MidiInputCallback, so you can connect it to both an audio and midi
-    input to send both streams through the processor. To set a MidiOutput for the processor,
-    use the setMidiOutput() method.
+    input to send both streams through the processor. To receive the midi inputs of an
+    AudioDeviceManager in the format that the processor uses, pass the manager to
+    setMidiInputDeviceManager() rather than registering this object with it. To set a
+    MidiOutput for the processor, use the setMidiOutput() method.
 
     @see AudioProcessor, AudioProcessorGraph
 
@@ -65,6 +67,13 @@ public:
 
         The processor that is passed in will not be deleted or owned by this object.
         To stop anything playing, pass a nullptr to this method.
+
+        If an AudioDeviceManager has been set with setMidiInputDeviceManager(), this must be
+        called on the message thread, because a processor that uses a different MIDI format (see
+        AudioProcessor::getMidiFormat()) moves the player's registration with the manager. A
+        message that arrives during the move may reach the processor twice, and a change between
+        the umpMidi1 and umpMidi2 formats discards any messages from the manager that are still
+        waiting for the next block.
     */
     void setProcessor (AudioProcessor* processorToPlay);
 
@@ -76,6 +85,23 @@ public:
         processor.
     */
     MidiMessageCollector& getMidiMessageCollector() noexcept        { return messageCollector; }
+
+    /** Sets the AudioDeviceManager whose MIDI inputs should be passed to the processor, if required.
+
+        The messages from all of the manager's enabled MIDI inputs, apart from active sense, reach
+        the processor in the format that it uses (see AudioProcessor::getMidiFormat()).
+
+        Use this instead of registering this object, or the collector returned by
+        getMidiMessageCollector(), with AudioDeviceManager::addMidiInputDeviceCallback(). Otherwise
+        each message may reach the processor twice, or the player may remove that registration
+        along with its own.
+
+        The manager will not be deleted or owned by this object. Before the manager is deleted,
+        pass a nullptr to this method. This must be called on the message thread, and while a
+        manager is set, the destructor removes the player's registration, so it must run on the
+        message thread too.
+    */
+    void setMidiInputDeviceManager (AudioDeviceManager* managerToUse);
 
     /** Sets the MIDI output that should be used, if required.
 
@@ -110,6 +136,10 @@ public:
     void handleIncomingMidiMessage (MidiInput*, const MidiMessage&) override;
 
 private:
+   #if JUCE_UNIT_TESTS
+    friend struct AudioProcessorPlayerTests;
+   #endif
+
     struct NumChannels
     {
         NumChannels() = default;
@@ -127,9 +157,27 @@ private:
         int ins = 0, outs = 0;
     };
 
+    /*  Passes the packets from the MIDI inputs of an AudioDeviceManager to the packet
+        collector, apart from active sense, which the manager also holds back from its
+        MidiInputCallback objects. There's one for each protocol, so that a registration can
+        be moved by adding the new one before removing the old one.
+    */
+    struct DeviceInput final : public ump::Consumer
+    {
+        explicit DeviceInput (UMPMessageCollector& c) : collector (c) {}
+
+        void consume (ump::Iterator, ump::Iterator, double) override;
+
+        UMPMessageCollector& collector;
+    };
+
     //==============================================================================
     NumChannels findMostSuitableLayout (const AudioProcessor&) const;
     void resizeChannels();
+    void prepareProcessor (AudioProcessor*);
+    void moveMidiInputs (AudioDeviceManager*, AudioProcessor::MidiFormat);
+    void addMidiInputs (AudioDeviceManager&, AudioProcessor::MidiFormat);
+    void removeMidiInputs (AudioDeviceManager&, AudioProcessor::MidiFormat);
 
     //==============================================================================
     AudioProcessor* processor = nullptr;
@@ -145,8 +193,17 @@ private:
 
     MidiBuffer incomingMidi;
     MidiMessageCollector messageCollector;
+    UMPBuffer incomingPackets;
+    UMPMessageCollector packetCollector;
+    ump::GenericUMPConverter midiToPackets { ump::PacketProtocol::MIDI_1_0 };
+    ump::ToBytestreamConverter packetsToMidi { 2048 };
+    AudioProcessor::MidiFormat midiFormat = AudioProcessor::MidiFormat::midiBuffer;
     MidiOutput* midiOutput = nullptr;
     uint64_t sampleCount = 0;
+
+    AudioDeviceManager* midiInputDeviceManager = nullptr;
+    AudioProcessor::MidiFormat midiInputFormat = AudioProcessor::MidiFormat::midiBuffer;
+    DeviceInput midi1Input { packetCollector }, midi2Input { packetCollector };
 
     AudioIODevice* currentDevice = nullptr;
     AudioWorkgroup currentWorkgroup;
