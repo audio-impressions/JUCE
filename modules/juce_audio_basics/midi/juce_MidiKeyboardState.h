@@ -122,6 +122,18 @@ public:
     */
     void processNextMidiEvent (const MidiMessage& message);
 
+    /** Looks at a key-up/down event in a Universal MIDI Packet and uses it to update the
+        state of this object.
+
+        A packet using the MIDI 1.0 protocol is handled in the same way as the equivalent
+        MidiMessage. Unlike in MIDI 1.0, a MIDI 2.0 note-on with a velocity of 0 is still
+        a note-on.
+
+        To process a buffer full of packets, use the processNextMidiBuffer() method
+        instead.
+    */
+    void processNextMidiEvent (ump::View packet);
+
     /** Scans a midi stream for up/down events and adds its own events to it.
 
         This will look for any up/down events and use them to update the internal state,
@@ -144,6 +156,31 @@ public:
                                 int startSample,
                                 int numSamples,
                                 bool injectIndirectEvents);
+
+    /** Scans a stream of Universal MIDI Packets for up/down events and adds its own
+        packets to it.
+
+        This will look for any up/down events and use them to update the internal state,
+        synchronously making suitable callbacks to the listeners.
+
+        If injectIndirectEvents is true, then packets to produce the recent noteOn() and
+        noteOff() calls will be added into the buffer, on group 0 and using the given protocol.
+
+        Only the section of the buffer whose timestamps are between startSample and
+        (startSample + numSamples) will be affected, and any packets added will be placed
+        between these times.
+
+        If you're going to use this method, you'll need to keep calling it regularly for
+        it to work satisfactorily.
+
+        To process a single packet at a time, use the processNextMidiEvent() method
+        instead.
+    */
+    void processNextMidiBuffer (UMPBuffer& buffer,
+                                int startSample,
+                                int numSamples,
+                                bool injectIndirectEvents,
+                                ump::PacketProtocol protocol);
 
     //==============================================================================
     /** Receives events from a MidiKeyboardState object. */
