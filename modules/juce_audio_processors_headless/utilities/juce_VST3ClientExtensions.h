@@ -63,6 +63,12 @@ struct VST3ClientExtensions
     /** This function may be used by implementations of queryInterface()
         in the VST3's implementation of IEditController to return
         additional supported interfaces.
+
+        To receive note expression, return an INoteExpressionController that
+        declares the types that you support. If getMidiFormat() returns umpMidi2,
+        Volume, Pan, Expression, Brightness and Vibrato arrive as Registered
+        Per-Note Controllers 7, 10, 11, 74 and 77 holding VST3's normalised values
+        (so 0x40000000 is 0 dB of Volume), and Tuning arrives as Pitch 7.25 (3).
     */
     virtual int32_t queryIEditController (const Steinberg::TUID, void** obj)
     {

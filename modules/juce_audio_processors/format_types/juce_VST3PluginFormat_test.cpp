@@ -668,6 +668,506 @@ public:
             expect (queue.getPointCount() == 0);
             expect (storage.size() == 1);
         }
+
+        beginTest ("UMPConverter builds MIDI 1.0 packets with the values that a MidiBuffer receives");
+        {
+            using namespace Steinberg::Vst;
+
+            const std::vector<uint8> sysEx { 0xf0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0xf7 };
+            const std::vector<Event> events { makeNoteOn (2, 60, 0.5f, 7, 10),
+                                              makePolyPressure (2, 60, 0.25f, 15),
+                                              makeNoteOff (2, 60, 1.0f, 7, 20),
+                                              makeLegacyController (3, 74, 100, 0, 25),
+                                              makeLegacyController (4, kPitchBend, 0x10, 0x40, 26),
+                                              makeSysEx (sysEx, 30) };
+
+            expect (toPackets (ump::PacketProtocol::MIDI_1_0, events).data
+                    == convertMidiBuffer (events, ump::PacketProtocol::MIDI_1_0).data);
+        }
+
+        beginTest ("UMPConverter keeps a MIDI 1.0 note-on with a very low velocity as a note-on");
+        {
+            UMPBuffer expected;
+            addPacket (expected, ump::Factory::makeNoteOnV1 (0, 0, 60, 1), 0);
+
+            const auto packets = toPackets (ump::PacketProtocol::MIDI_1_0, { makeNoteOn (0, 60, 0.001f, -1, 0) });
+            expect (packets.data == expected.data);
+        }
+
+        beginTest ("UMPConverter builds MIDI 2.0 notes and poly pressure with their full resolution");
+        {
+            constexpr auto none = ump::Factory::NoteAttributeKind::none;
+
+            const auto packets = toPackets (ump::PacketProtocol::MIDI_2_0, { makeNoteOn (0, 60, 0.5f, -1, 0),
+                                                                             makeNoteOn (15, 127, 1.0f, -1, 1),
+                                                                             makeNoteOn (1, 0, 0.0f, -1, 2),
+                                                                             makePolyPressure (0, 60, 0.5f, 3),
+                                                                             makePolyPressure (0, 60, 1.0f, 4),
+                                                                             makeNoteOff (0, 60, 0.25f, -1, 5) });
+
+            UMPBuffer expected;
+            addPacket (expected, ump::Factory::makeNoteOnV2 (0, 0, 60, none, 0x8000, 0), 0);
+            addPacket (expected, ump::Factory::makeNoteOnV2 (0, 15, 127, none, 0xffff, 0), 1);
+            addPacket (expected, ump::Factory::makeNoteOnV2 (0, 1, 0, none, 0, 0), 2);
+            addPacket (expected, ump::Factory::makePolyPressureV2 (0, 0, 60, 0x80000000), 3);
+            addPacket (expected, ump::Factory::makePolyPressureV2 (0, 0, 60, 0xffffffff), 4);
+            addPacket (expected, ump::Factory::makeNoteOffV2 (0, 0, 60, none, 0x4000, 0), 5);
+
+            expect (packets.data == expected.data);
+        }
+
+        beginTest ("UMPConverter clamps values that are out of range");
+        {
+            constexpr auto none = ump::Factory::NoteAttributeKind::none;
+
+            const std::vector<Steinberg::Vst::Event> events { makeNoteOn (-1, -5, -0.5f, -1, 0),
+                                                              makeNoteOn (16, 200, 1.5f, -1, 1),
+                                                              makePolyPressure (3, 64, 2.0f, 2),
+                                                              makePolyPressure (3, 64, -1.0f, 3) };
+
+            UMPBuffer expected1;
+            addPacket (expected1, ump::Factory::makeNoteOnV1 (0, 0, 0, 1), 0);
+            addPacket (expected1, ump::Factory::makeNoteOnV1 (0, 15, 127, 127), 1);
+            addPacket (expected1, ump::Factory::makePolyPressureV1 (0, 3, 64, 127), 2);
+            addPacket (expected1, ump::Factory::makePolyPressureV1 (0, 3, 64, 0), 3);
+            addPacket (expected1, ump::Factory::makeControlChangeV1 (0, 0, 7, 127), 4);
+            addPacket (expected1, ump::Factory::makeControlChangeV1 (0, 15, 7, 0), 5);
+
+            UMPBuffer expected2;
+            addPacket (expected2, ump::Factory::makeNoteOnV2 (0, 0, 0, none, 0, 0), 0);
+            addPacket (expected2, ump::Factory::makeNoteOnV2 (0, 15, 127, none, 0xffff, 0), 1);
+            addPacket (expected2, ump::Factory::makePolyPressureV2 (0, 3, 64, 0xffffffff), 2);
+            addPacket (expected2, ump::Factory::makePolyPressureV2 (0, 3, 64, 0), 3);
+            addPacket (expected2, ump::Factory::makeControlChangeV2 (0, 0, 7, 0xffffffff), 4);
+            addPacket (expected2, ump::Factory::makeControlChangeV2 (0, 15, 7, 0), 5);
+
+            for (const auto& [protocol, expected] : { std::tuple (ump::PacketProtocol::MIDI_1_0, &expected1),
+                                                      std::tuple (ump::PacketProtocol::MIDI_2_0, &expected2) })
+            {
+                MidiEventList::UMPConverter converter;
+                converter.reset (protocol);
+
+                auto packets = toPackets (converter, events);
+                converter.addController (packets, 0, 7, 1.5, 4);
+                converter.addController (packets, 17, 7, -0.5, 5);
+
+                expect (packets.data == expected->data);
+            }
+        }
+
+        beginTest ("UMPConverter sends note expression to a MIDI 2.0 processor as per-note controllers");
+        {
+            using namespace Steinberg::Vst;
+
+            constexpr auto none = ump::Factory::NoteAttributeKind::none;
+            const auto oneSemitoneUp = 0.5 + 1.0 / 240.0;
+
+            const auto packets = toPackets (ump::PacketProtocol::MIDI_2_0,
+                                            { makeNoteOn (1, 64, 1.0f, 5, 0),
+                                              makeNoteExpression (kVolumeTypeID, 5, 0.25, 1),
+                                              makeNoteExpression (kPanTypeID, 5, 0.5, 2),
+                                              makeNoteExpression (kExpressionTypeID, 5, 1.0, 3),
+                                              makeNoteExpression (kBrightnessTypeID, 5, 0.0, 4),
+                                              makeNoteExpression (kVibratoTypeID, 5, 0.75, 5),
+                                              makeNoteExpression (kTuningTypeID, 5, oneSemitoneUp, 6),
+                                              makeNoteExpression (kTuningTypeID, 5, 0.0, 7),
+                                              makeNoteExpression (kTuningTypeID, 5, 1.0, 8),
+                                              makeNoteExpression (kCustomStart, 5, 0.5, 9),
+                                              makeNoteExpression (kVolumeTypeID, 6, 0.5, 9),
+                                              makeNoteOff (1, 64, 0.0f, 5, 10),
+                                              makeNoteExpression (kVolumeTypeID, 5, 0.5, 11) });
+
+            const auto makeController = [] (uint8_t index, uint32_t data)
+            {
+                return ump::Factory::makeRegisteredPerNoteControllerV2 (0, 1, 64, index, data);
+            };
+
+            UMPBuffer expected;
+            addPacket (expected, ump::Factory::makeNoteOnV2 (0, 1, 64, none, 0xffff, 0), 0);
+            addPacket (expected, makeController (7, 0x40000000), 1);
+            addPacket (expected, makeController (10, 0x80000000), 2);
+            addPacket (expected, makeController (11, 0xffffffff), 3);
+            addPacket (expected, makeController (74, 0), 4);
+            addPacket (expected, makeController (77, 0xbfffffff), 5);
+            addPacket (expected, makeController (3, 65u << 25), 6);
+            addPacket (expected, makeController (3, 0), 7);
+            addPacket (expected, makeController (3, 0xffffffff), 8);
+            addPacket (expected, ump::Factory::makeNoteOffV2 (0, 1, 64, none, 0, 0), 10);
+
+            expect (packets.data == expected.data);
+        }
+
+        beginTest ("UMPConverter doesn't send note expression for notes that have ended, or to a MIDI 1.0 processor");
+        {
+            using namespace Steinberg::Vst;
+
+            const std::vector<Event> endedNote { makeNoteOn (2, 50, 1.0f, 8, 0),
+                                                 makeNoteOff (2, 50, 1.0f, -1, 1),
+                                                 makeNoteExpression (kVolumeTypeID, 8, 0.5, 2) };
+
+            expect (countPerNoteControllers (toPackets (ump::PacketProtocol::MIDI_2_0, endedNote)) == 0);
+
+            const std::vector<Event> playingNote { makeNoteOn (2, 50, 1.0f, 8, 0),
+                                                   makeNoteExpression (kVolumeTypeID, 8, 0.5, 1) };
+
+            expect (countPerNoteControllers (toPackets (ump::PacketProtocol::MIDI_2_0, playingNote)) == 1);
+            expect (toPackets (ump::PacketProtocol::MIDI_1_0, playingNote).getNumPackets() == 1);
+        }
+
+        beginTest ("UMPConverter detaches and resets the per-note controllers of a key before its next note-on");
+        {
+            using namespace Steinberg::Vst;
+
+            constexpr auto none = ump::Factory::NoteAttributeKind::none;
+
+            MidiEventList::UMPConverter converter;
+            converter.reset (ump::PacketProtocol::MIDI_2_0);
+
+            const auto packets = toPackets (converter, { makeNoteOn (0, 64, 1.0f, 1, 0),
+                                                         makeNoteExpression (kVolumeTypeID, 1, 0.5, 1),
+                                                         makeNoteOff (0, 64, 1.0f, 1, 2),
+                                                         makeNoteOn (0, 64, 1.0f, 2, 3),
+                                                         makeNoteOff (0, 64, 1.0f, 2, 4),
+                                                         makeNoteOn (0, 64, 1.0f, 3, 5),
+                                                         makeNoteOn (1, 64, 1.0f, 4, 6) });
+
+            UMPBuffer expected;
+            addPacket (expected, ump::Factory::makeNoteOnV2 (0, 0, 64, none, 0xffff, 0), 0);
+            addPacket (expected, ump::Factory::makeRegisteredPerNoteControllerV2 (0, 0, 64, 7, 0x80000000), 1);
+            addPacket (expected, ump::Factory::makeNoteOffV2 (0, 0, 64, none, 0xffff, 0), 2);
+            addPacket (expected, ump::Factory::makePerNoteManagementV2 (0, 0, 64, std::byte { 0x3 }), 3);
+            addPacket (expected, ump::Factory::makeNoteOnV2 (0, 0, 64, none, 0xffff, 0), 3);
+            addPacket (expected, ump::Factory::makeNoteOffV2 (0, 0, 64, none, 0xffff, 0), 4);
+            addPacket (expected, ump::Factory::makeNoteOnV2 (0, 0, 64, none, 0xffff, 0), 5);
+            addPacket (expected, ump::Factory::makeNoteOnV2 (0, 1, 64, none, 0xffff, 0), 6);
+
+            expect (packets.data == expected.data);
+
+            toPackets (converter, { makeNoteOn (0, 60, 1.0f, 5, 0), makeNoteExpression (kPanTypeID, 5, 0.5, 1) });
+            converter.reset (ump::PacketProtocol::MIDI_2_0);
+
+            expect (toPackets (converter, { makeNoteOn (0, 60, 1.0f, 6, 0) }).getNumPackets() == 1);
+        }
+
+        beginTest ("UMPConverter keeps track of the notes that are playing from one block to the next");
+        {
+            using namespace Steinberg::Vst;
+
+            MidiEventList::UMPConverter converter;
+            converter.reset (ump::PacketProtocol::MIDI_2_0);
+
+            std::vector<Event> noteOns;
+
+            for (auto i = 0; i < 257; ++i)
+                noteOns.push_back (makeNoteOn (0, i % 128, 1.0f, 1000 + i, 0));
+
+            toPackets (converter, noteOns);
+
+            // Only the 256 notes that started last can receive note expression
+            const auto packets = toPackets (converter, { makeNoteExpression (kVolumeTypeID, 1000, 0.5, 0),
+                                                         makeNoteExpression (kVolumeTypeID, 1001, 0.5, 1),
+                                                         makeNoteExpression (kVolumeTypeID, 1256, 0.5, 2) });
+
+            expect (countPerNoteControllers (packets) == 2);
+
+            converter.reset (ump::PacketProtocol::MIDI_2_0);
+
+            const auto afterReset = toPackets (converter, { makeNoteExpression (kVolumeTypeID, 1256, 0.5, 0) });
+            expect (countPerNoteControllers (afterReset) == 0);
+        }
+
+        beginTest ("UMPConverter builds the controllers that IMidiMapping assigns to parameters");
+        {
+            using namespace Steinberg::Vst;
+
+            for (const auto value : { 0.0, 0.1, 0.25, 0.5, 64.0 / 127.0, 0.99, 1.0 })
+            {
+                for (const auto controller : { 7, (int) kAfterTouch, (int) kPitchBend })
+                {
+                    MidiEventList::UMPConverter converter1, converter2;
+                    converter1.reset (ump::PacketProtocol::MIDI_1_0);
+                    converter2.reset (ump::PacketProtocol::MIDI_2_0);
+
+                    UMPBuffer packets1, packets2;
+                    converter1.addController (packets1, 3, controller, value, 0);
+                    converter2.addController (packets2, 3, controller, value, 0);
+
+                    // The MIDI 1.0 packet has the values that the MidiBuffer version would have
+                    const auto expectedMidi1 = [&]
+                    {
+                        if (controller == kAfterTouch)
+                            return MidiMessage::channelPressureChange (3, jlimit (0, 127, (int) (value * 128.0)));
+
+                        if (controller == kPitchBend)
+                            return MidiMessage::pitchWheel (3, jlimit (0, 0x3fff, (int) (value * 0x4000)));
+
+                        return MidiMessage::controllerEvent (3, controller, jlimit (0, 127, (int) (value * 128.0)));
+                    }();
+
+                    MidiBuffer midi;
+                    midi.addEvent (expectedMidi1, 0);
+                    ump::GenericUMPConverter toMidi1 { ump::PacketProtocol::MIDI_1_0 };
+                    UMPBuffer expected;
+                    expected.addFromMidiBuffer (midi, toMidi1);
+
+                    expect (packets1.data == expected.data);
+
+                    // Narrowing the MIDI 2.0 value gives the MIDI 1.0 value
+                    const auto word1 = (*packets1.begin()).packet[0];
+                    const auto packet2 = (*packets2.begin()).packet;
+                    const auto byte2 = (int) ump::Utils::U8<2>::get (word1);
+                    const auto byte3 = (int) ump::Utils::U8<3>::get (word1);
+
+                    expect (ump::Utils::getMessageType (packet2[0]) == ump::Utils::MessageKind::channelVoice2);
+                    expect (ump::Utils::getStatus (packet2[0]) == ump::Utils::getStatus (word1));
+                    expect (ump::Utils::getChannel (packet2[0]) == 2);
+
+                    if (controller == kPitchBend)
+                        expect ((int) ump::Conversion::scaleTo14 (packet2[1]) == (byte2 | (byte3 << 7)));
+                    else if (controller == kAfterTouch)
+                        expect ((int) ump::Conversion::scaleTo7 (packet2[1]) == byte2);
+                    else
+                        expect ((int) ump::Conversion::scaleTo7 (packet2[1]) == byte3);
+                }
+            }
+        }
+
+        beginTest ("UMPConverter sends a MIDI 2.0 processor the RPNs from IMidiMapping as registered controllers");
+        {
+            const auto addControllers = [] (MidiEventList::UMPConverter& converter, UMPBuffer& packets)
+            {
+                converter.addController (packets, 1, 101, 0.0, 0);
+                converter.addController (packets, 1, 100, 0.0, 0);
+                converter.addController (packets, 1, 6, 2.0 / 128.0, 0);
+                converter.addController (packets, 1, 38, 0.0, 0);
+                converter.addController (packets, 1, 0, 0.5, 1);
+                converter.addPendingPackets (packets);
+            };
+
+            MidiEventList::UMPConverter converter2;
+            converter2.reset (ump::PacketProtocol::MIDI_2_0);
+            UMPBuffer packets2;
+            addControllers (converter2, packets2);
+
+            const auto data = ump::Conversion::scaleTo32 ((uint16_t) (2 << 7));
+            UMPBuffer expected2;
+            addPacket (expected2, ump::Factory::makeRegisteredControllerV2 (0, 0, 0, 0, data), 0);
+
+            expect (packets2.data == expected2.data);
+
+            MidiEventList::UMPConverter converter1;
+            converter1.reset (ump::PacketProtocol::MIDI_1_0);
+            UMPBuffer packets1;
+            addControllers (converter1, packets1);
+
+            UMPBuffer expected1;
+            addPacket (expected1, ump::Factory::makeControlChangeV1 (0, 0, 101, 0), 0);
+            addPacket (expected1, ump::Factory::makeControlChangeV1 (0, 0, 100, 0), 0);
+            addPacket (expected1, ump::Factory::makeControlChangeV1 (0, 0, 6, 2), 0);
+            addPacket (expected1, ump::Factory::makeControlChangeV1 (0, 0, 38, 0), 0);
+            addPacket (expected1, ump::Factory::makeControlChangeV1 (0, 0, 0, 64), 1);
+
+            expect (packets1.data == expected1.data);
+        }
+
+        beginTest ("UMPConverter translates the RPNs for a MIDI 2.0 processor in time order");
+        {
+            MidiEventList::UMPConverter converter;
+            converter.reset (ump::PacketProtocol::MIDI_2_0);
+
+            // RPN 0 is set to 12 before the null RPN is selected, but the parameter changes arrive one
+            // queue at a time, and the LSB of the value arrives as an event
+            UMPBuffer packets;
+            converter.addController (packets, 1, 101, 0.0, 0);
+            converter.addController (packets, 1, 101, 127.0 / 128.0, 10);
+            converter.addController (packets, 1, 100, 0.0, 0);
+            converter.addController (packets, 1, 100, 127.0 / 128.0, 10);
+            converter.addController (packets, 1, 6, 12.0 / 128.0, 1);
+
+            MidiEventList events;
+            addEvents (events, { makeLegacyController (0, 38, 0, 0, 2) });
+            converter.toUMPBuffer (packets, events);
+            converter.addPendingPackets (packets);
+
+            const auto data = ump::Conversion::scaleTo32 ((uint16_t) (12 << 7));
+            UMPBuffer expected;
+            addPacket (expected, ump::Factory::makeRegisteredControllerV2 (0, 0, 0, 0, data), 2);
+
+            expect (packets.data == expected.data);
+        }
+
+        beginTest ("UMPConverter translates MIDI 1.0 events for a MIDI 2.0 processor as it would a MidiBuffer");
+        {
+            using namespace Steinberg::Vst;
+
+            const std::vector<uint8> sysEx { 0xf0, 0x7e, 0x7f, 0x06, 0x01, 0xf7 };
+            const std::vector<Event> events { makeLegacyController (0, 74, 100, 0, 0),
+                                              makeLegacyController (1, kPitchBend, 0x7f, 0x7f, 1),
+                                              makeLegacyController (2, kAfterTouch, 0x40, 0, 2),
+                                              makeLegacyController (3, kCtrlProgramChange, 5, 0, 3),
+                                              makeSysEx (sysEx, 4) };
+
+            expect (toPackets (ump::PacketProtocol::MIDI_2_0, events).data
+                    == convertMidiBuffer (events, ump::PacketProtocol::MIDI_2_0).data);
+        }
+
+        beginTest ("UMPConverter sends the host MIDI 1.0 packets as the MidiBuffer version sends the same messages");
+        {
+            const uint8 sysEx[] { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+
+            MidiBuffer midi;
+            midi.addEvent (MidiMessage::noteOn (1, 60, (uint8) 100), 0);
+            midi.addEvent (MidiMessage::noteOff (1, 60, (uint8) 20), 5);
+            midi.addEvent (MidiMessage::controllerEvent (2, 7, 64), 6);
+            midi.addEvent (MidiMessage::pitchWheel (3, 1000), 7);
+            midi.addEvent (MidiMessage::aftertouchChange (4, 60, 50), 8);
+            midi.addEvent (MidiMessage::channelPressureChange (5, 30), 9);
+            midi.addEvent (MidiMessage::programChange (6, 3), 10);
+            midi.addEvent (MidiMessage::createSysExMessage (sysEx, (int) std::size (sysEx)), 11);
+            midi.addEvent (MidiMessage::quarterFrame (2, 5), 12);
+            midi.addEvent (MidiMessage::midiClock(), 13);
+
+            MidiEventList expected;
+            MidiEventList::pluginToHostEventList (expected, midi);
+
+            ump::GenericUMPConverter toMidi1 { ump::PacketProtocol::MIDI_1_0 };
+            UMPBuffer packets;
+            packets.addFromMidiBuffer (midi, toMidi1);
+
+            MidiEventList::UMPConverter converter;
+            converter.reset (ump::PacketProtocol::MIDI_1_0);
+            MidiEventList result;
+            converter.pluginToHostEventList (result, packets);
+
+            expect (eventListsMatch (result, expected));
+        }
+
+        beginTest ("UMPConverter sends the host MIDI 2.0 notes at full velocity, and other messages as MIDI 1.0");
+        {
+            using namespace Steinberg::Vst;
+
+            constexpr auto none = ump::Factory::NoteAttributeKind::none;
+
+            UMPBuffer packets;
+            addPacket (packets, ump::Factory::makeNoteOnV2 (0, 1, 60, none, 0x8000, 0), 0);
+            addPacket (packets, ump::Factory::makeNoteOffV2 (0, 1, 60, none, 0xffff, 0), 1);
+            addPacket (packets, ump::Factory::makeControlChangeV2 (0, 2, 7, 0x80000000), 2);
+            addPacket (packets, ump::Factory::makeRegisteredPerNoteControllerV2 (0, 1, 60, 7, 0x80000000), 3);
+            addPacket (packets, ump::Factory::makePitchBendV2 (0, 3, 0xffffffff), 4);
+            addPacket (packets, ump::Factory::makePolyPressureV2 (0, 4, 60, 0x80000000), 5);
+            addPacket (packets, ump::Factory::makePerNotePitchBendV2 (0, 1, 60, 0), 6);
+
+            MidiEventList::UMPConverter converter;
+            converter.reset (ump::PacketProtocol::MIDI_2_0);
+            MidiEventList result;
+            converter.pluginToHostEventList (result, packets);
+
+            expect (result.getEventCount() == 5);
+
+            const auto noteOn = getEvent (result, 0);
+            expect (noteOn.type == Event::kNoteOnEvent);
+            expect (noteOn.sampleOffset == 0);
+            expect (noteOn.noteOn.channel == 1 && noteOn.noteOn.pitch == 60 && noteOn.noteOn.noteId == -1);
+            expect (exactlyEqual (noteOn.noteOn.velocity, (float) 0x8000 / 65535.0f));
+
+            const auto noteOff = getEvent (result, 1);
+            expect (noteOff.type == Event::kNoteOffEvent);
+            expect (noteOff.sampleOffset == 1);
+            expect (noteOff.noteOff.channel == 1 && noteOff.noteOff.pitch == 60);
+            expect (exactlyEqual (noteOff.noteOff.velocity, 1.0f));
+
+            const auto expectController = [&] (Steinberg::int32 index, int sampleOffset, LegacyMIDICCOutEvent cc)
+            {
+                const auto e = getEvent (result, index);
+                expect (e.type == Event::kLegacyMIDICCOutEvent);
+                expect (e.sampleOffset == sampleOffset);
+                expect (e.midiCCOut.channel == cc.channel);
+                expect (e.midiCCOut.controlNumber == cc.controlNumber);
+                expect (e.midiCCOut.value == cc.value);
+                expect (e.midiCCOut.value2 == cc.value2);
+            };
+
+            expectController (2, 2, { 7, 2, 64, 0 });
+            expectController (3, 4, { kPitchBend, 3, 0x7f, 0x7f });
+            expectController (4, 5, { kCtrlPolyPressure, 4, 60, 64 });
+        }
+
+        beginTest ("UMPConverter sends the host each SysEx message whose packets are all in the buffer");
+        {
+            const std::array<std::byte, 6> first { std::byte { 0x01 }, std::byte { 0x02 }, std::byte { 0x03 },
+                                                   std::byte { 0x04 }, std::byte { 0x05 }, std::byte { 0x06 } };
+            const std::array<std::byte, 1> last { std::byte { 0x07 } };
+            const std::array<std::byte, 2> complete { std::byte { 0x08 }, std::byte { 0x09 } };
+
+            UMPBuffer packets;
+            addPacket (packets, ump::Factory::makeSysExStart (0, first), 0);
+            addPacket (packets, ump::Factory::makeSysExEnd (0, last), 0);
+            addPacket (packets, ump::Factory::makeSysExIn1Packet (0, complete), 1);
+            addPacket (packets, ump::Factory::makeSysExEnd (0, last), 2);
+            addPacket (packets, ump::Factory::makeSysExStart (0, first), 3);
+
+            MidiEventList::UMPConverter converter;
+            converter.reset (ump::PacketProtocol::MIDI_2_0);
+            MidiEventList result;
+            converter.pluginToHostEventList (result, packets);
+
+            expect (result.getEventCount() == 2);
+
+            const auto expectSysEx = [&] (Steinberg::int32 index, int sampleOffset, std::vector<uint8> bytes)
+            {
+                const auto e = getEvent (result, index);
+                expect (e.type == Steinberg::Vst::Event::kDataEvent);
+                expect (e.sampleOffset == sampleOffset);
+                expect (e.data.type == Steinberg::Vst::DataEvent::kMidiSysEx);
+                expect (std::vector<uint8> (e.data.bytes, e.data.bytes + e.data.size) == bytes);
+            };
+
+            expectSysEx (0, 0, { 0xf0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0xf7 });
+            expectSysEx (1, 1, { 0xf0, 0x08, 0x09, 0xf7 });
+        }
+
+        beginTest ("UMPConverter has room for the SysEx in a full buffer");
+        {
+            const std::array<std::byte, 6> bytes { std::byte { 0x01 }, std::byte { 0x02 }, std::byte { 0x03 },
+                                                   std::byte { 0x04 }, std::byte { 0x05 }, std::byte { 0x06 } };
+
+            // Each packet takes 3 of the 2048 words that the VST3 wrapper reserves
+            UMPBuffer packets;
+            constexpr auto numPackets = 2048 / 3;
+
+            for (auto i = 0; i < numPackets; ++i)
+                addPacket (packets, ump::Factory::makeSysExIn1Packet (0, bytes), i);
+
+            MidiEventList::UMPConverter converter;
+            converter.reset (ump::PacketProtocol::MIDI_2_0);
+            MidiEventList result;
+            converter.pluginToHostEventList (result, packets);
+
+            expect (result.getEventCount() == numPackets);
+
+            const std::vector<uint8> expected { 0xf0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xf7 };
+
+            for (const auto index : { 0, numPackets - 1 })
+            {
+                const auto e = getEvent (result, index);
+                expect (std::vector<uint8> (e.data.bytes, e.data.bytes + e.data.size) == expected);
+            }
+        }
+
+        beginTest ("UMPConverter sends no more than 2048 events to the host at once");
+        {
+            UMPBuffer packets;
+
+            for (auto i = 0; i < 3000; ++i)
+                addPacket (packets, ump::Factory::makeNoteOnV1 (0, 0, (uint8_t) (i % 128), 100), i);
+
+            MidiEventList::UMPConverter converter;
+            converter.reset (ump::PacketProtocol::MIDI_1_0);
+            MidiEventList result;
+            converter.pluginToHostEventList (result, packets);
+
+            expect (result.getEventCount() == 2048);
+        }
     }
 
 private:
@@ -766,6 +1266,193 @@ private:
         result.outputs = outs.buffers.data();
         result.numOutputs = (Steinberg::int32) outs.buffers.size();
         return result;
+    }
+
+    //==============================================================================
+    template <typename Packet>
+    static void addPacket (UMPBuffer& buffer, const Packet& packet, int samplePosition)
+    {
+        buffer.addPacket (ump::View (packet.data()), samplePosition);
+    }
+
+    static Steinberg::Vst::Event makeEvent (Steinberg::uint16 type, int sampleOffset)
+    {
+        Steinberg::Vst::Event e{};
+        e.type = type;
+        e.sampleOffset = sampleOffset;
+        return e;
+    }
+
+    static Steinberg::Vst::Event makeNoteOn (int channel, int pitch, float velocity, int noteId, int sampleOffset)
+    {
+        auto e = makeEvent (Steinberg::Vst::Event::kNoteOnEvent, sampleOffset);
+        e.noteOn.channel = (Steinberg::int16) channel;
+        e.noteOn.pitch = (Steinberg::int16) pitch;
+        e.noteOn.velocity = velocity;
+        e.noteOn.noteId = noteId;
+        return e;
+    }
+
+    static Steinberg::Vst::Event makeNoteOff (int channel, int pitch, float velocity, int noteId, int sampleOffset)
+    {
+        auto e = makeEvent (Steinberg::Vst::Event::kNoteOffEvent, sampleOffset);
+        e.noteOff.channel = (Steinberg::int16) channel;
+        e.noteOff.pitch = (Steinberg::int16) pitch;
+        e.noteOff.velocity = velocity;
+        e.noteOff.noteId = noteId;
+        return e;
+    }
+
+    static Steinberg::Vst::Event makePolyPressure (int channel, int pitch, float pressure, int sampleOffset)
+    {
+        auto e = makeEvent (Steinberg::Vst::Event::kPolyPressureEvent, sampleOffset);
+        e.polyPressure.channel = (Steinberg::int16) channel;
+        e.polyPressure.pitch = (Steinberg::int16) pitch;
+        e.polyPressure.pressure = pressure;
+        e.polyPressure.noteId = -1;
+        return e;
+    }
+
+    static Steinberg::Vst::Event makeNoteExpression (Steinberg::Vst::NoteExpressionTypeID typeId,
+                                                     int noteId,
+                                                     double value,
+                                                     int sampleOffset)
+    {
+        auto e = makeEvent (Steinberg::Vst::Event::kNoteExpressionValueEvent, sampleOffset);
+        e.noteExpressionValue.typeId = typeId;
+        e.noteExpressionValue.noteId = noteId;
+        e.noteExpressionValue.value = value;
+        return e;
+    }
+
+    static Steinberg::Vst::Event makeLegacyController (int channel,
+                                                       int number,
+                                                       int value,
+                                                       int value2,
+                                                       int sampleOffset)
+    {
+        auto e = makeEvent (Steinberg::Vst::Event::kLegacyMIDICCOutEvent, sampleOffset);
+        e.midiCCOut.channel = (Steinberg::int8) channel;
+        e.midiCCOut.controlNumber = (Steinberg::uint8) number;
+        e.midiCCOut.value = (Steinberg::int8) value;
+        e.midiCCOut.value2 = (Steinberg::int8) value2;
+        return e;
+    }
+
+    static Steinberg::Vst::Event makeSysEx (const std::vector<uint8>& bytes, int sampleOffset)
+    {
+        auto e = makeEvent (Steinberg::Vst::Event::kDataEvent, sampleOffset);
+        e.data.type = Steinberg::Vst::DataEvent::kMidiSysEx;
+        e.data.bytes = bytes.data();
+        e.data.size = (Steinberg::uint32) bytes.size();
+        return e;
+    }
+
+    static void addEvents (MidiEventList& list, const std::vector<Steinberg::Vst::Event>& events)
+    {
+        for (auto e : events)
+            list.addEvent (e);
+    }
+
+    static UMPBuffer toPackets (MidiEventList::UMPConverter& converter,
+                                const std::vector<Steinberg::Vst::Event>& events)
+    {
+        MidiEventList list;
+        addEvents (list, events);
+
+        UMPBuffer result;
+        converter.toUMPBuffer (result, list);
+        converter.addPendingPackets (result);
+        return result;
+    }
+
+    static UMPBuffer toPackets (ump::PacketProtocol protocol, const std::vector<Steinberg::Vst::Event>& events)
+    {
+        MidiEventList::UMPConverter converter;
+        converter.reset (protocol);
+        return toPackets (converter, events);
+    }
+
+    // Converts the events to a MidiBuffer, which is then converted in the same way as an AudioProcessorPlayer
+    // converts the messages that it receives in a MidiBuffer
+    static UMPBuffer convertMidiBuffer (const std::vector<Steinberg::Vst::Event>& events, ump::PacketProtocol protocol)
+    {
+        MidiEventList list;
+        addEvents (list, events);
+
+        MidiBuffer midi;
+        MidiEventList::toMidiBuffer (midi, list);
+
+        ump::GenericUMPConverter converter { protocol };
+        UMPBuffer result;
+        result.addFromMidiBuffer (midi, converter);
+        return result;
+    }
+
+    static int countPerNoteControllers (const UMPBuffer& packets)
+    {
+        return (int) std::count_if (packets.begin(), packets.end(), [] (const UMPPacketMetadata& metadata)
+        {
+            return ump::Utils::getMessageType (metadata.packet[0]) == ump::Utils::MessageKind::channelVoice2
+                && ump::Utils::getStatus (metadata.packet[0]) == std::byte { 0x0 };
+        });
+    }
+
+    static Steinberg::Vst::Event getEvent (MidiEventList& list, Steinberg::int32 index)
+    {
+        Steinberg::Vst::Event e{};
+        list.getEvent (index, e);
+        return e;
+    }
+
+    static bool eventsMatch (const Steinberg::Vst::Event& a, const Steinberg::Vst::Event& b)
+    {
+        if (a.type != b.type || a.busIndex != b.busIndex || a.sampleOffset != b.sampleOffset)
+            return false;
+
+        switch (a.type)
+        {
+            case Steinberg::Vst::Event::kNoteOnEvent:
+                return a.noteOn.channel == b.noteOn.channel
+                    && a.noteOn.pitch == b.noteOn.pitch
+                    && exactlyEqual (a.noteOn.velocity, b.noteOn.velocity)
+                    && exactlyEqual (a.noteOn.tuning, b.noteOn.tuning)
+                    && a.noteOn.length == b.noteOn.length
+                    && a.noteOn.noteId == b.noteOn.noteId;
+
+            case Steinberg::Vst::Event::kNoteOffEvent:
+                return a.noteOff.channel == b.noteOff.channel
+                    && a.noteOff.pitch == b.noteOff.pitch
+                    && exactlyEqual (a.noteOff.velocity, b.noteOff.velocity)
+                    && exactlyEqual (a.noteOff.tuning, b.noteOff.tuning)
+                    && a.noteOff.noteId == b.noteOff.noteId;
+
+            case Steinberg::Vst::Event::kDataEvent:
+                return a.data.type == b.data.type
+                    && a.data.size == b.data.size
+                    && std::equal (a.data.bytes, a.data.bytes + a.data.size, b.data.bytes);
+
+            case Steinberg::Vst::Event::kLegacyMIDICCOutEvent:
+                return a.midiCCOut.channel == b.midiCCOut.channel
+                    && a.midiCCOut.controlNumber == b.midiCCOut.controlNumber
+                    && a.midiCCOut.value == b.midiCCOut.value
+                    && a.midiCCOut.value2 == b.midiCCOut.value2;
+
+            default:
+                return false;
+        }
+    }
+
+    static bool eventListsMatch (MidiEventList& a, MidiEventList& b)
+    {
+        if (a.getEventCount() != b.getEventCount())
+            return false;
+
+        for (Steinberg::int32 i = 0; i < a.getEventCount(); ++i)
+            if (! eventsMatch (getEvent (a, i), getEvent (b, i)))
+                return false;
+
+        return true;
     }
 };
 

@@ -3525,7 +3525,7 @@ public:
                     for (Steinberg::int32 point = 0; point < numPoints; ++point)
                     {
                         if (const auto change = getPointFromQueue (paramQueue, point))
-                            addParameterChangeToMidiBuffer (change->offsetSamples, vstParamID, change->value);
+                            addParameterChangeToMidi (change->offsetSamples, vstParamID, change->value);
                     }
                 }
                 else
@@ -3539,14 +3539,16 @@ public:
         }
     }
 
-    void addParameterChangeToMidiBuffer (const Steinberg::int32 offsetSamples, const Vst::ParamID id, const double value)
+    void addParameterChangeToMidi (const Steinberg::int32 offsetSamples, const Vst::ParamID id, const double value)
     {
-        // If the parameter is mapped to a MIDI CC message then insert it into the midiBuffer.
+        // If the parameter is mapped to a MIDI CC message then add it to the plugin's MIDI input
         int channel, ctrlNumber;
 
         if (juceVST3EditController->getMidiControllerForParameter (id, channel, ctrlNumber))
         {
-            if (ctrlNumber == Vst::kAfterTouch)
+            if (receivesUMP())
+                umpConverter.addController (umpBuffer, channel, ctrlNumber, value, offsetSamples);
+            else if (ctrlNumber == Vst::kAfterTouch)
                 midiBuffer.addEvent (MidiMessage::channelPressureChange (channel,
                                                                          jlimit (0, 127, (int) (value * 128.0))), offsetSamples);
             else if (ctrlNumber == Vst::kPitchBend)
@@ -3586,13 +3588,24 @@ public:
 
         midiBuffer.clear();
 
+        if (receivesUMP())
+            umpBuffer.clear();
+
         if (data.inputParameterChanges != nullptr)
             processParameterChanges (*data.inputParameterChanges);
 
        #if JucePlugin_WantsMidiInput
         if (isMidiInputBusEnabled && data.inputEvents != nullptr)
-            MidiEventList::toMidiBuffer (midiBuffer, *data.inputEvents);
+        {
+            if (receivesUMP())
+                umpConverter.toUMPBuffer (umpBuffer, *data.inputEvents);
+            else
+                MidiEventList::toMidiBuffer (midiBuffer, *data.inputEvents);
+        }
        #endif
+
+        if (receivesUMP())
+            umpConverter.addPendingPackets (umpBuffer);
 
         if (detail::PluginUtilities::getHostType().isWavelab())
         {
@@ -3628,7 +3641,12 @@ public:
 
        #if JucePlugin_ProducesMidiOutput
         if (isMidiOutputBusEnabled && data.outputEvents != nullptr)
-            MidiEventList::pluginToHostEventList (*data.outputEvents, midiBuffer);
+        {
+            if (receivesUMP())
+                umpConverter.pluginToHostEventList (*data.outputEvents, umpBuffer);
+            else
+                MidiEventList::pluginToHostEventList (*data.outputEvents, midiBuffer);
+        }
        #endif
 
         return kResultTrue;
@@ -3703,6 +3721,15 @@ private:
     template <typename FloatType>
     void processAudio (Vst::ProcessData& data)
     {
+        if (receivesUMP())
+            processAudio<FloatType> (data, umpBuffer);
+        else
+            processAudio<FloatType> (data, midiBuffer);
+    }
+
+    template <typename FloatType, typename MidiMessages>
+    void processAudio (Vst::ProcessData& data, MidiMessages& midiMessages)
+    {
         ClientRemappedBuffer<FloatType> remappedBuffer { bufferMapper, data };
         auto& buffer = remappedBuffer.buffer;
 
@@ -3715,7 +3742,7 @@ private:
             pluginInstance->setNonRealtime (data.processMode == Vst::kOffline);
 
            #if JUCE_DEBUG && ! JucePlugin_ProducesMidiOutput
-            const int numMidiEventsComingIn = midiBuffer.getNumEvents();
+            const int numMidiEventsComingIn = getNumEvents (midiMessages);
            #endif
 
             if (pluginInstance->isSuspended())
@@ -3727,9 +3754,9 @@ private:
                 // processBlockBypassed should only ever be called if the AudioProcessor doesn't
                 // return a valid parameter from getBypassParameter
                 if (pluginInstance->getBypassParameter() == nullptr && comPluginInstance->getBypassParameter()->getValue() >= 0.5f)
-                    pluginInstance->processBlockBypassed (buffer, midiBuffer);
+                    processBlockBypassedWithMidi (*pluginInstance, buffer, midiMessages);
                 else
-                    pluginInstance->processBlock (buffer, midiBuffer);
+                    processBlockWithMidi (*pluginInstance, buffer, midiMessages);
             }
 
            #if JUCE_DEBUG && (! JucePlugin_ProducesMidiOutput)
@@ -3747,10 +3774,42 @@ private:
                 indicate that you don't want any of the events to be passed through
                 to the output.
             */
-            jassert (midiBuffer.getNumEvents() <= numMidiEventsComingIn);
+            jassert (getNumEvents (midiMessages) <= numMidiEventsComingIn);
            #endif
         }
     }
+
+    bool receivesUMP() const
+    {
+        return midiFormat != AudioProcessor::MidiFormat::midiBuffer;
+    }
+
+    template <typename FloatType>
+    static void processBlockWithMidi (AudioProcessor& p, AudioBuffer<FloatType>& buffer, MidiBuffer& midi)
+    {
+        p.processBlock (buffer, midi);
+    }
+
+    template <typename FloatType>
+    static void processBlockWithMidi (AudioProcessor& p, AudioBuffer<FloatType>& buffer, UMPBuffer& packets)
+    {
+        p.processBlockUMP (buffer, packets);
+    }
+
+    template <typename FloatType>
+    static void processBlockBypassedWithMidi (AudioProcessor& p, AudioBuffer<FloatType>& buffer, MidiBuffer& midi)
+    {
+        p.processBlockBypassed (buffer, midi);
+    }
+
+    template <typename FloatType>
+    static void processBlockBypassedWithMidi (AudioProcessor& p, AudioBuffer<FloatType>& buffer, UMPBuffer& packets)
+    {
+        p.processBlockBypassedUMP (buffer, packets);
+    }
+
+    static int getNumEvents (const MidiBuffer& midi)        { return midi.getNumEvents(); }
+    static int getNumEvents (const UMPBuffer& packets)      { return packets.getNumPackets(); }
 
     //==============================================================================
     Steinberg::uint32 PLUGIN_API getProcessContextRequirements() override
@@ -3779,6 +3838,17 @@ private:
 
         midiBuffer.ensureSize (2048);
         midiBuffer.clear();
+
+        midiFormat = p.getMidiFormat();
+
+        if (receivesUMP())
+        {
+            const auto usesMidi2 = midiFormat == AudioProcessor::MidiFormat::umpMidi2;
+
+            umpBuffer.ensureSize (2048);
+            umpBuffer.clear();
+            umpConverter.reset (usesMidi2 ? ump::PacketProtocol::MIDI_2_0 : ump::PacketProtocol::MIDI_1_0);
+        }
 
         bufferMapper.updateFromProcessor (p);
         bufferMapper.prepare (bufferSize);
@@ -3857,6 +3927,9 @@ private:
     Vst::ProcessSetup processSetup;
 
     MidiBuffer midiBuffer;
+    UMPBuffer umpBuffer;
+    MidiEventList::UMPConverter umpConverter;
+    AudioProcessor::MidiFormat midiFormat = AudioProcessor::MidiFormat::midiBuffer;
     ClientBufferMapper bufferMapper;
 
     bool active = false;

@@ -1206,6 +1206,8 @@ public:
         toEventList (result, midiBuffer, nullptr, [] (auto&&...) {});
     }
 
+    class UMPConverter;
+
 private:
     enum class EventConversionKind
     {
@@ -1298,28 +1300,56 @@ private:
     static float normaliseMidiValue (int value) noexcept              { return jlimit (0.0f, 1.0f, (float) value / 127.0f); }
     static int denormaliseToMidiValue (float value) noexcept          { return roundToInt (jlimit (0.0f, 127.0f, value * 127.0f)); }
 
-    static Steinberg::Vst::Event createNoteOnEvent (const MidiMessage& msg) noexcept
+    static Steinberg::Vst::Event createNoteOnEvent (Steinberg::int16 channel,
+                                                    Steinberg::int16 pitch,
+                                                    float velocity) noexcept
     {
         Steinberg::Vst::Event e{};
         e.type              = Steinberg::Vst::Event::kNoteOnEvent;
-        e.noteOn.channel    = createSafeChannel (msg.getChannel());
-        e.noteOn.pitch      = createSafeNote (msg.getNoteNumber());
-        e.noteOn.velocity   = normaliseMidiValue (msg.getVelocity());
+        e.noteOn.channel    = channel;
+        e.noteOn.pitch      = pitch;
+        e.noteOn.velocity   = velocity;
         e.noteOn.length     = 0;
         e.noteOn.tuning     = 0.0f;
         e.noteOn.noteId     = -1;
         return e;
     }
 
-    static Steinberg::Vst::Event createNoteOffEvent (const MidiMessage& msg) noexcept
+    static Steinberg::Vst::Event createNoteOnEvent (const MidiMessage& msg) noexcept
+    {
+        return createNoteOnEvent (createSafeChannel (msg.getChannel()),
+                                  createSafeNote (msg.getNoteNumber()),
+                                  normaliseMidiValue (msg.getVelocity()));
+    }
+
+    static Steinberg::Vst::Event createNoteOffEvent (Steinberg::int16 channel,
+                                                     Steinberg::int16 pitch,
+                                                     float velocity) noexcept
     {
         Steinberg::Vst::Event e{};
         e.type              = Steinberg::Vst::Event::kNoteOffEvent;
-        e.noteOff.channel   = createSafeChannel (msg.getChannel());
-        e.noteOff.pitch     = createSafeNote (msg.getNoteNumber());
-        e.noteOff.velocity  = normaliseMidiValue (msg.getVelocity());
+        e.noteOff.channel   = channel;
+        e.noteOff.pitch     = pitch;
+        e.noteOff.velocity  = velocity;
         e.noteOff.tuning    = 0.0f;
         e.noteOff.noteId    = -1;
+        return e;
+    }
+
+    static Steinberg::Vst::Event createNoteOffEvent (const MidiMessage& msg) noexcept
+    {
+        return createNoteOffEvent (createSafeChannel (msg.getChannel()),
+                                   createSafeNote (msg.getNoteNumber()),
+                                   normaliseMidiValue (msg.getVelocity()));
+    }
+
+    static Steinberg::Vst::Event createSysExEvent (const uint8* data, int size) noexcept
+    {
+        Steinberg::Vst::Event e{};
+        e.type          = Steinberg::Vst::Event::kDataEvent;
+        e.data.bytes    = data;
+        e.data.size     = (uint32) size;
+        e.data.type     = Steinberg::Vst::DataEvent::kMidiSysEx;
         return e;
     }
 
@@ -1327,12 +1357,7 @@ private:
     {
         jassert (msg.isSysEx());
 
-        Steinberg::Vst::Event e{};
-        e.type          = Steinberg::Vst::Event::kDataEvent;
-        e.data.bytes    = data;
-        e.data.size     = (uint32) msg.getRawDataSize();
-        e.data.type     = Steinberg::Vst::DataEvent::kMidiSysEx;
-        return e;
+        return createSysExEvent (data, msg.getRawDataSize());
     }
 
     static Steinberg::Vst::Event createLegacyMIDIEvent (int channel, int controlNumber, int value, int value2 = 0)
@@ -1484,13 +1509,13 @@ private:
         }
     }
 
-    static Optional<MidiMessage> toMidiMessage (const Steinberg::Vst::DataEvent& e)
+    static bool isSysExMessage (const Steinberg::Vst::DataEvent& e)
     {
         if (e.type != Steinberg::Vst::DataEvent::kMidiSysEx || e.size < 2)
         {
             // Only sysex data messages can be converted to MIDI
             jassertfalse;
-            return {};
+            return false;
         }
 
         const auto header = e.bytes[0];
@@ -1500,8 +1525,16 @@ private:
         {
             // The sysex header/footer bytes are missing
             jassertfalse;
-            return {};
+            return false;
         }
+
+        return true;
+    }
+
+    static Optional<MidiMessage> toMidiMessage (const Steinberg::Vst::DataEvent& e)
+    {
+        if (! isSysExMessage (e))
+            return {};
 
         return MidiMessage::createSysExMessage (e.bytes + 1, (int) e.size - 2);
     }
@@ -1568,6 +1601,533 @@ private:
     }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiEventList)
+};
+
+//==============================================================================
+/*  Converts between the events that a VST3 host exchanges with a plug-in and the Universal MIDI
+    Packets of a plug-in whose AudioProcessor receives its MIDI in a UMPBuffer.
+
+    VST3 has no equivalent of Universal MIDI Packets, so each packet is built from an event in the
+    protocol that the processor uses, and the processor's packets are converted back into events.
+    VST3 sends a note-off as an event of its own, so a MIDI 1.0 note-on gets a velocity of at least
+    1, as it does in JUCE's MIDI 2.0 to MIDI 1.0 translation, rather than becoming a note-off.
+
+    Using the MIDI 2.0 protocol, note expression becomes Registered Per-Note Controllers that hold
+    VST3's normalised values. Note expression refers to a note by its ID, whereas a per-note message
+    refers to it by its channel and key, so the converter keeps track of the notes that are playing
+    from one block to the next. A per-note controller stays with its key until Per-Note Management
+    detaches and resets it, so the converter sends that message before a note-on on a key that has
+    received any.
+    A host only sends the types of note expression that a plug-in declares in its
+    INoteExpressionController, which a plug-in can provide with
+    VST3ClientExtensions::queryIEditController().
+*/
+class MidiEventList::UMPConverter
+{
+public:
+    /*  Prepares for a new stream of blocks for a processor that uses the given protocol.
+        This allocates, so it must not be called on the audio thread.
+    */
+    void reset (ump::PacketProtocol newProtocol)
+    {
+        protocol = newProtocol;
+        translator.reset();
+        pendingPackets.ensureSize (2048);
+        pendingPackets.clear();
+        numPlayingNotes = 0;
+        keysWithControllers.fill (false);
+        sysExData.clear();
+        sysExData.reserve (maxNumSysExBytes);
+    }
+
+    /*  Adds a packet for each event that the processor's protocol can represent. */
+    void toUMPBuffer (UMPBuffer& result, Steinberg::Vst::IEventList& eventList)
+    {
+        const auto numEvents = eventList.getEventCount();
+
+        for (Steinberg::int32 i = 0; i < numEvents; ++i)
+        {
+            Steinberg::Vst::Event e;
+
+            if (eventList.getEvent (i, e) == Steinberg::kResultOk)
+                addPackets (result, e);
+        }
+    }
+
+    /*  Adds a packet for a parameter that IMidiMapping assigns to a MIDI controller, where the
+        channel is between 1 and 16, and the controller may also be kAfterTouch or kPitchBend.
+    */
+    void addController (UMPBuffer& result, int channel, int controller, double value, int sampleOffset)
+    {
+        const auto umpChannel = (uint8_t) (jlimit (1, 16, channel) - 1);
+
+        // MIDI 2.0 replaces bank select, and the controllers that make up RPNs and NRPNs, with other
+        // messages, which addPendingPackets() builds. MIDI 2.0 only selects a bank in a program change,
+        // which IMidiMapping doesn't carry, so bank select from a parameter never reaches a processor
+        // that uses MIDI 2.0 unless the host also sends a program change event
+        if (protocol == ump::PacketProtocol::MIDI_1_0 || isReplacedInMidi2 (controller))
+        {
+            // The values are scaled in the same way as those in a MidiBuffer
+            const auto value7  = (uint8_t)  jlimit (0, 127,    (int) (value * 128.0));
+            const auto value14 = (uint16_t) jlimit (0, 0x3fff, (int) (value * 0x4000));
+
+            const auto packet = [&]
+            {
+                if (controller == Steinberg::Vst::kAfterTouch)
+                    return ump::Factory::makeChannelPressureV1 (0, umpChannel, value7);
+
+                if (controller == Steinberg::Vst::kPitchBend)
+                    return ump::Factory::makePitchBend (0, umpChannel, value14);
+
+                return ump::Factory::makeControlChangeV1 (0, umpChannel, (uint8_t) controller, value7);
+            }();
+
+            addMidi1Packet (result, ump::View (packet.data()), sampleOffset);
+            return;
+        }
+
+        // Narrowing these values to 7 or 14 bits gives the values that MIDI 1.0 would have
+        const auto packet = [&]
+        {
+            const auto value32 = (uint32_t) jlimit (0.0, 4294967295.0, value * 4294967296.0);
+
+            if (controller == Steinberg::Vst::kAfterTouch)
+                return ump::Factory::makeChannelPressureV2 (0, umpChannel, value32);
+
+            if (controller == Steinberg::Vst::kPitchBend)
+                return ump::Factory::makePitchBendV2 (0, umpChannel, value32);
+
+            return ump::Factory::makeControlChangeV2 (0, umpChannel, (uint8_t) controller, value32);
+        }();
+
+        result.addPacket (ump::View (packet.data()), sampleOffset);
+    }
+
+    /*  Using the MIDI 2.0 protocol, adds the packets that are translated from MIDI 1.0 messages,
+        which wait until all of a block's controllers and events have been added so that they're
+        translated in time order. This must be called once for each block, after toUMPBuffer() and
+        addController().
+    */
+    void addPendingPackets (UMPBuffer& result)
+    {
+        for (const auto metadata : pendingPackets)
+        {
+            translator.dispatch (metadata.packet, [&] (const ump::View& translated)
+            {
+                result.addPacket (translated, metadata.samplePosition);
+            });
+        }
+
+        pendingPackets.clear();
+    }
+
+    /*  Adds an event for each packet that has an equivalent among the events that a plug-in can
+        send to a host. As in the MidiBuffer version, MIDI 1.0 messages other than notes become
+        LegacyMIDICCOutEvents, and MIDI 2.0 messages other than notes are translated to MIDI 1.0
+        first. A SysEx message is only sent if all of its packets are in the buffer.
+    */
+    void pluginToHostEventList (Steinberg::Vst::IEventList& result, const UMPBuffer& packets)
+    {
+        // Steinberg's Host Checker states that no more than 2048 events are allowed at once
+        constexpr auto maxNumEvents = 2048;
+        auto numEvents = 0;
+
+        const auto addEvent = [&] (Steinberg::Vst::Event e, int samplePosition)
+        {
+            if (++numEvents > maxNumEvents)
+                return;
+
+            e.busIndex = 0;
+            e.sampleOffset = samplePosition;
+            result.addEvent (e);
+        };
+
+        const auto addMidi1Event = [&] (const ump::View& packet, int samplePosition)
+        {
+            const auto message = ump::SingleGroupMidi1ToBytestreamExtractor::fromUmp (ump::PacketX1 { packet[0] });
+
+            if (const auto e = createVstEvent (message, message.getRawData(), EventConversionKind::pluginToHost))
+                addEvent (*e, samplePosition);
+        };
+
+        sysExData.clear();
+        std::optional<size_t> sysExStart;
+
+        for (const auto metadata : packets)
+        {
+            if (numEvents >= maxNumEvents)
+                break;
+
+            const auto& packet = metadata.packet;
+            const auto samplePosition = metadata.samplePosition;
+
+            switch (ump::Utils::getMessageType (packet[0]))
+            {
+                case ump::Utils::MessageKind::commonRealtime:
+                case ump::Utils::MessageKind::channelVoice1:
+                    addMidi1Event (packet, samplePosition);
+                    break;
+
+                case ump::Utils::MessageKind::channelVoice2:
+                {
+                    const auto status = ump::Utils::getStatus (packet[0]);
+
+                    // VST3 has no events for the MIDI 2.0 messages that MIDI 1.0 can't represent,
+                    // such as per-note controllers
+                    if (status != std::byte { 0x8 } && status != std::byte { 0x9 })
+                    {
+                        ump::Conversion::midi2ToMidi1DefaultTranslation (packet, [&] (const ump::View& midi1)
+                        {
+                            addMidi1Event (midi1, samplePosition);
+                        });
+
+                        break;
+                    }
+
+                    const auto channel  = (Steinberg::int16) ump::Utils::getChannel (packet[0]);
+                    const auto pitch    = (Steinberg::int16) (ump::Utils::U8<2>::get (packet[0]) & 0x7f);
+                    const auto velocity = (float) ump::Utils::U16<0>::get (packet[1]) / 65535.0f;
+
+                    addEvent (status == std::byte { 0x9 } ? createNoteOnEvent (channel, pitch, velocity)
+                                                          : createNoteOffEvent (channel, pitch, velocity),
+                              samplePosition);
+                    break;
+                }
+
+                case ump::Utils::MessageKind::sysex7:
+                {
+                    const auto kind = ump::SysEx7::Kind ((uint8_t) ump::Utils::getStatus (packet[0]));
+                    const auto bytes = ump::SysEx7::getDataBytes (ump::PacketX2 { packet[0], packet[1] });
+
+                    // The host reads the events after process() returns, so the SysEx data mustn't move
+                    // once an event points to it. If this is hit, the processor has sent more SysEx in a
+                    // block than there's room for, and the rest is lost
+                    if (sysExData.size() + maxNumBytesPerSysExPacket > sysExData.capacity())
+                    {
+                        jassertfalse;
+                        sysExStart.reset();
+                        break;
+                    }
+
+                    if (kind == ump::SysEx7::Kind::complete || kind == ump::SysEx7::Kind::begin)
+                    {
+                        sysExStart = sysExData.size();
+                        sysExData.push_back (0xf0);
+                    }
+
+                    if (! sysExStart.has_value())
+                        break;
+
+                    for (uint8_t i = 0; i < bytes.size; ++i)
+                        sysExData.push_back ((uint8) bytes.data[i]);
+
+                    if (kind == ump::SysEx7::Kind::complete || kind == ump::SysEx7::Kind::end)
+                    {
+                        sysExData.push_back (0xf7);
+
+                        const auto size = (int) (sysExData.size() - *sysExStart);
+                        addEvent (createSysExEvent (sysExData.data() + *sysExStart, size), samplePosition);
+                        sysExStart.reset();
+                    }
+
+                    break;
+                }
+
+                case ump::Utils::MessageKind::utility:
+                case ump::Utils::MessageKind::sysex8:
+                case ump::Utils::MessageKind::stream:
+                    break;
+            }
+        }
+    }
+
+private:
+    struct PlayingNote
+    {
+        Steinberg::int32 noteId;
+        uint8_t channel, key;
+    };
+
+    struct PerNoteController
+    {
+        uint8_t index;
+        uint32_t data;
+    };
+
+    void addPackets (UMPBuffer& result, const Steinberg::Vst::Event& e)
+    {
+        const auto samplePosition = (int) e.sampleOffset;
+        const auto usesMidi1 = protocol == ump::PacketProtocol::MIDI_1_0;
+
+        const auto addPacket = [&] (const auto& packet)
+        {
+            result.addPacket (ump::View (packet.data()), samplePosition);
+        };
+
+        switch (e.type)
+        {
+            case Steinberg::Vst::Event::kNoteOnEvent:
+            {
+                const auto channel = getChannel (e.noteOn.channel);
+                const auto key = getKey (e.noteOn.pitch);
+                const auto velocity = e.noteOn.velocity;
+
+                if (usesMidi1)
+                {
+                    const auto velocity7 = jmax (uint8_t { 1 }, denormaliseTo7Bit (velocity));
+                    addPacket (ump::Factory::makeNoteOnV1 (0, channel, key, velocity7));
+                    return;
+                }
+
+                addPlayingNote (e.noteOn.noteId, channel, key);
+
+                // Otherwise, the per-note controllers of an earlier note on this key would apply to this one
+                if (keysWithControllers[getKeyIndex (channel, key)])
+                {
+                    addPacket (ump::Factory::makePerNoteManagementV2 (0, channel, key, detachAndResetControllers));
+                    keysWithControllers[getKeyIndex (channel, key)] = false;
+                }
+
+                addPacket (ump::Factory::makeNoteOnV2 (0, channel, key, ump::Factory::NoteAttributeKind::none,
+                                                       denormaliseTo16Bit (velocity), 0));
+                return;
+            }
+
+            case Steinberg::Vst::Event::kNoteOffEvent:
+            {
+                const auto channel = getChannel (e.noteOff.channel);
+                const auto key = getKey (e.noteOff.pitch);
+                const auto velocity = e.noteOff.velocity;
+
+                if (usesMidi1)
+                {
+                    addPacket (ump::Factory::makeNoteOffV1 (0, channel, key, denormaliseTo7Bit (velocity)));
+                    return;
+                }
+
+                removePlayingNote (e.noteOff.noteId, channel, key);
+                addPacket (ump::Factory::makeNoteOffV2 (0, channel, key, ump::Factory::NoteAttributeKind::none,
+                                                        denormaliseTo16Bit (velocity), 0));
+                return;
+            }
+
+            case Steinberg::Vst::Event::kPolyPressureEvent:
+            {
+                const auto channel = getChannel (e.polyPressure.channel);
+                const auto key = getKey (e.polyPressure.pitch);
+                const auto pressure = e.polyPressure.pressure;
+
+                if (usesMidi1)
+                    addPacket (ump::Factory::makePolyPressureV1 (0, channel, key, denormaliseTo7Bit (pressure)));
+                else
+                    addPacket (ump::Factory::makePolyPressureV2 (0, channel, key, denormaliseTo32Bit (pressure)));
+
+                return;
+            }
+
+            case Steinberg::Vst::Event::kNoteExpressionValueEvent:
+            {
+                const auto* note = findPlayingNote (e.noteExpressionValue.noteId);
+
+                if (usesMidi1 || note == nullptr)
+                    return;
+
+                if (const auto controller = toPerNoteController (e.noteExpressionValue, note->key))
+                {
+                    addPacket (ump::Factory::makeRegisteredPerNoteControllerV2 (0, note->channel, note->key,
+                                                                                controller->index, controller->data));
+                    keysWithControllers[getKeyIndex (note->channel, note->key)] = true;
+                }
+
+                return;
+            }
+
+            case Steinberg::Vst::Event::kDataEvent:
+            {
+                if (isSysExMessage (e.data))
+                {
+                    const ump::BytesOnGroup message { 0, Span (unalignedPointerCast<const std::byte*> (e.data.bytes),
+                                                               (size_t) e.data.size) };
+
+                    ump::Conversion::toMidi1 (message, [&] (const ump::View& packet)
+                    {
+                        result.addPacket (packet, samplePosition);
+                    });
+                }
+
+                return;
+            }
+
+            case Steinberg::Vst::Event::kLegacyMIDICCOutEvent:
+            {
+                if (const auto message = toMidiMessage (e.midiCCOut))
+                {
+                    ump::Conversion::toMidi1 (ump::BytesOnGroup { 0, message->asSpan() }, [&] (const ump::View& packet)
+                    {
+                        addMidi1Packet (result, packet, samplePosition);
+                    });
+                }
+
+                return;
+            }
+
+            // Text, chords and scales have no equivalent, and no predefined type of note expression is an integer
+            case Steinberg::Vst::Event::kNoteExpressionTextEvent:
+            case Steinberg::Vst::Event::kNoteExpressionIntValueEvent:
+            case Steinberg::Vst::Event::kChordEvent:
+            case Steinberg::Vst::Event::kScaleEvent:
+            default:
+                return;
+        }
+    }
+
+    void addMidi1Packet (UMPBuffer& result, const ump::View& packet, int samplePosition)
+    {
+        if (protocol == ump::PacketProtocol::MIDI_1_0)
+            result.addPacket (packet, samplePosition);
+        else
+            pendingPackets.addPacket (packet, samplePosition);
+    }
+
+    void addPlayingNote (Steinberg::int32 noteId, uint8_t channel, uint8_t key)
+    {
+        if (noteId == -1)
+            return;
+
+        removePlayingNotes ([&] (const PlayingNote& note) { return note.noteId == noteId; });
+
+        // When there's no more room, the note that started first can no longer receive note expression
+        if (numPlayingNotes == playingNotes.size())
+        {
+            std::move (playingNotes.begin() + 1, playingNotes.end(), playingNotes.begin());
+            --numPlayingNotes;
+        }
+
+        playingNotes[numPlayingNotes++] = { noteId, channel, key };
+    }
+
+    void removePlayingNote (Steinberg::int32 noteId, uint8_t channel, uint8_t key)
+    {
+        // A note-off without an ID ends every note on its key
+        removePlayingNotes ([&] (const PlayingNote& note)
+        {
+            return noteId != -1 ? note.noteId == noteId
+                                : note.channel == channel && note.key == key;
+        });
+    }
+
+    template <typename Predicate>
+    void removePlayingNotes (Predicate&& predicate)
+    {
+        const auto begin = playingNotes.begin();
+        const auto end = std::remove_if (begin, begin + (std::ptrdiff_t) numPlayingNotes, predicate);
+        numPlayingNotes = (size_t) std::distance (begin, end);
+    }
+
+    const PlayingNote* findPlayingNote (Steinberg::int32 noteId) const
+    {
+        if (noteId == -1)
+            return nullptr;
+
+        const auto begin = playingNotes.begin();
+        const auto end = begin + (std::ptrdiff_t) numPlayingNotes;
+        const auto iter = std::find_if (begin, end, [&] (const PlayingNote& note) { return note.noteId == noteId; });
+
+        return iter != end ? &*iter : nullptr;
+    }
+
+    static bool isReplacedInMidi2 (int controller)
+    {
+        switch (controller)
+        {
+            case 0:
+            case 6:
+            case 32:
+            case 38:
+            case 98:
+            case 99:
+            case 100:
+            case 101:
+                return true;
+        }
+
+        return false;
+    }
+
+    static std::optional<PerNoteController> toPerNoteController (const Steinberg::Vst::NoteExpressionValueEvent& e,
+                                                                 uint8_t key)
+    {
+        const auto value = jlimit (0.0, 1.0, e.value);
+
+        switch (e.typeId)
+        {
+            case Steinberg::Vst::kVolumeTypeID:      return PerNoteController { 7,  denormaliseTo32Bit (value) };
+            case Steinberg::Vst::kPanTypeID:         return PerNoteController { 10, denormaliseTo32Bit (value) };
+            case Steinberg::Vst::kExpressionTypeID:  return PerNoteController { 11, denormaliseTo32Bit (value) };
+            case Steinberg::Vst::kBrightnessTypeID:  return PerNoteController { 74, denormaliseTo32Bit (value) };
+            case Steinberg::Vst::kVibratoTypeID:     return PerNoteController { 77, denormaliseTo32Bit (value) };
+
+            case Steinberg::Vst::kTuningTypeID:
+            {
+                // The tuning moves the note by up to 120 semitones either way, and Pitch 7.25 holds the
+                // note's pitch in semitones, so no pitch bend sensitivity has to be assumed
+                const auto pitch = std::round (((double) key + 240.0 * (value - 0.5)) * (double) (1 << 25));
+                return PerNoteController { 3, (uint32_t) jlimit (0.0, 4294967295.0, pitch) };
+            }
+
+            default:
+                break;
+        }
+
+        return {};
+    }
+
+    static size_t getKeyIndex (uint8_t channel, uint8_t key) noexcept
+    {
+        return (size_t) channel * 128 + key;
+    }
+
+    static uint8_t getChannel (Steinberg::int16 channel) noexcept
+    {
+        return (uint8_t) (createSafeChannel (channel) - 1);
+    }
+
+    static uint8_t getKey (Steinberg::int16 pitch) noexcept
+    {
+        return (uint8_t) createSafeNote (pitch);
+    }
+
+    static uint8_t denormaliseTo7Bit (float value) noexcept
+    {
+        return (uint8_t) denormaliseToMidiValue (value);
+    }
+
+    static uint16_t denormaliseTo16Bit (float value) noexcept
+    {
+        return (uint16_t) roundToInt (jlimit (0.0f, 65535.0f, value * 65535.0f));
+    }
+
+    static uint32_t denormaliseTo32Bit (double value) noexcept
+    {
+        return (uint32_t) std::round (jlimit (0.0, 4294967295.0, value * 4294967295.0));
+    }
+
+    // The option flags of Per-Note Management that detach the per-note controllers from the notes
+    // already on a key (D), and reset them to their defaults (S)
+    static constexpr auto detachAndResetControllers = std::byte { 0x3 };
+
+    // A SysEx7 packet adds up to 6 bytes, plus the 2 that frame a message. The VST3 wrapper's buffer
+    // of 2048 words holds up to 2048 / 3 SysEx7 packets, as each needs a word for its time too
+    static constexpr size_t maxNumBytesPerSysExPacket = 8;
+    static constexpr size_t maxNumSysExBytes = maxNumBytesPerSysExPacket * 2048 / 3;
+
+    ump::PacketProtocol protocol = ump::PacketProtocol::MIDI_1_0;
+    ump::Midi1ToMidi2DefaultTranslator translator;
+    UMPBuffer pendingPackets;
+    std::array<PlayingNote, 256> playingNotes {};
+    size_t numPlayingNotes = 0;
+    std::array<bool, 16 * 128> keysWithControllers {};
+    std::vector<uint8> sysExData;
 };
 
 //==============================================================================
