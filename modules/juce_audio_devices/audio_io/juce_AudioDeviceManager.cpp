@@ -530,14 +530,10 @@ String AudioDeviceManager::initialiseFromXML (const XmlElement& xml,
     setup.useDefaultInputChannels  = ! xml.hasAttribute ("audioDeviceInChans");
     setup.useDefaultOutputChannels = ! xml.hasAttribute ("audioDeviceOutChans");
 
-    error = setAudioDeviceSetup (setup, true);
-
-    if (error.isNotEmpty() && selectDefaultDeviceOnFailure)
-        error = initialise (numInputChansNeeded, numOutputChansNeeded, nullptr, false, preferredDefaultDeviceName);
-
+    // The MIDI inputs are reset before setAudioDeviceSetup(), which may save them by calling updateXml()
     enabledMidiInputs.clear();
 
-    const auto midiInputs = [&]
+    midiDeviceInfosFromXml = [&]
     {
         Array<MidiDeviceInfo> result;
 
@@ -547,10 +543,15 @@ String AudioDeviceManager::initialiseFromXML (const XmlElement& xml,
         return result;
     }();
 
+    error = setAudioDeviceSetup (setup, true);
+
+    if (error.isNotEmpty() && selectDefaultDeviceOnFailure)
+        error = initialise (numInputChansNeeded, numOutputChansNeeded, nullptr, false, preferredDefaultDeviceName);
+
     const MidiDeviceInfo defaultOutputDeviceInfo (xml.getStringAttribute ("defaultMidiOutput"),
                                                   xml.getStringAttribute ("defaultMidiOutputDevice"));
 
-    openLastRequestedMidiDevices (midiInputs, defaultOutputDeviceInfo);
+    openLastRequestedMidiDevices (midiDeviceInfosFromXml, defaultOutputDeviceInfo);
 
     return error;
 }
@@ -1747,6 +1748,44 @@ public:
 
             ptr->restartDevices (newSr, newBs);
             expectEquals (numCalls, 1);
+        }
+
+        beginTest ("When initialising from XML, MIDI inputs that aren't available are kept in the saved state");
+        {
+            const MidiDeviceInfo unavailableInput { "Nonexistent MIDI input", "nonexistent-midi-input-id" };
+
+            XmlElement xml ("DEVICESETUP");
+            xml.setAttribute ("deviceType", mockAName);
+            xml.setAttribute ("audioOutputDeviceName", "x");
+            xml.setAttribute ("audioInputDeviceName", "a");
+
+            auto* midiInput = xml.createNewChildElement ("MIDIINPUT");
+            midiInput->setAttribute ("name", unavailableInput.name);
+            midiInput->setAttribute ("identifier", unavailableInput.identifier);
+
+            const auto getMidiInputs = [] (const std::unique_ptr<XmlElement>& state)
+            {
+                Array<MidiDeviceInfo> result;
+
+                if (state != nullptr)
+                    for (auto* c : state->getChildWithTagNameIterator ("MIDIINPUT"))
+                        result.add ({ c->getStringAttribute ("name"), c->getStringAttribute ("identifier") });
+
+                return result;
+            };
+
+            AudioDeviceManager manager;
+            initialiseManager (manager);
+            expect (manager.initialise (2, 2, &xml, false).isEmpty());
+
+            const auto state = manager.createStateXml();
+            expect (getMidiInputs (state) == Array<MidiDeviceInfo> { unavailableInput });
+
+            AudioDeviceManager reloaded;
+            initialiseManager (reloaded);
+            expect (reloaded.initialise (2, 2, state.get(), false).isEmpty());
+
+            expect (getMidiInputs (reloaded.createStateXml()) == Array<MidiDeviceInfo> { unavailableInput });
         }
     }
 
