@@ -98,6 +98,16 @@ public:
         mainCopy.erase (&l);
     }
 
+    /** Returns true if no listeners are registered, *not* wait-free.
+
+        Only the thread that adds and removes listeners can rely on the result staying valid.
+    */
+    [[nodiscard]] bool isEmpty() const
+    {
+        const std::scoped_lock lock { mainCopyMutex };
+        return mainCopy.empty();
+    }
+
     /** Notifies all registered receivers, wait-free, may be called concurrently with add/remove,
         and with itself.
     */

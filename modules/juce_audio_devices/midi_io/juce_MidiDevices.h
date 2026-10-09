@@ -138,7 +138,10 @@ class MidiInputCallback;
 
 //==============================================================================
 /**
-    Represents a midi input device using the old bytestream format.
+    Represents a midi input device.
+
+    Incoming messages are passed to MidiInputCallback objects using the old bytestream format, and
+    can also be passed to ump::Consumer objects as Universal MIDI Packets (see addConsumer()).
 
     To create one of these, use the static getAvailableDevices() method to find out what
     inputs are available, and then use the openDevice() method to try to open one.
@@ -241,6 +244,40 @@ public:
 
     /** Removed an input listener. */
     void removeCallback (MidiInputCallback&);
+
+    /** Adds a consumer that will receive the Universal MIDI Packets for this input's group, in the
+        given protocol.
+
+        Consumers that want MIDI 1.0 share the connection that serves the MidiInputCallback objects.
+        While any consumer wants MIDI 2.0, a second connection to the endpoint is kept open using
+        that protocol. If it can't be opened, or this input was created with createNewDevice(), the
+        consumer receives MIDI 1.0 instead.
+
+        Packets are only passed on while the input is started, and messages that have no group, such
+        as utility and stream messages, are never passed on. Adding a consumer again replaces its
+        previous registration. If that changes the protocol it receives, a message that arrives
+        during the change may be missed, or passed on twice, once in each protocol.
+
+        Consumers must only be added and removed on the message thread, and never from within
+        ump::Consumer::consume(), which is called on a separate thread, often with high or even
+        realtime priority.
+
+        @returns true if the consumer will receive packets in the requested protocol
+        @see removeConsumer
+    */
+    bool addConsumer (ump::Consumer& consumer, ump::PacketProtocol protocol);
+
+    /** Removes a consumer that was previously added with addConsumer().
+
+        After this function returns, the consumer will not be called again. If the consumer is
+        being called when this function is called, it waits for that call to return.
+
+        This must be called on the message thread, and never from within a call to
+        ump::Consumer::consume().
+
+        @see addConsumer
+    */
+    void removeConsumer (ump::Consumer& consumer);
 
     /** Adds a listener, which will be notified if the device gets disconnected. */
     void addDisconnectionListener (ump::DisconnectionListener&);

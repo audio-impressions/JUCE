@@ -65,10 +65,12 @@ public:
             receivers.add (receiver);
 
             expect (receiver.numCalls == 0);
+            expect (! receivers.isEmpty());
 
             receivers.remove (receiver);
 
             expect (receiver.numCalls == 0);
+            expect (receivers.isEmpty());
         });
 
         testCase ("Notifying receivers works", [&]
