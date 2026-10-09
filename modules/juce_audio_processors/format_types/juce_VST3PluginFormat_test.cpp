@@ -1154,6 +1154,44 @@ public:
             }
         }
 
+       #if JUCE_VST3_MIDI2_NOTE_ON_ATTRIBUTES
+        beginTest ("UMPConverter gives a MIDI 2.0 note-on the attribute that the host sends as note expression");
+        {
+            constexpr auto none = ump::Factory::NoteAttributeKind::none;
+            constexpr auto pitch7_9 = ump::Factory::NoteAttributeKind::pitch7_9;
+            constexpr auto profile = ump::Factory::NoteAttributeKind::profile;
+
+            const std::vector<Steinberg::Vst::Event> events { makeNoteOn (0, 60, 1.0f, 1, 0),
+                                                              makeNoteOnAttribute (203003, 1, 0x1234abcd, 0),
+                                                              makeNoteOnAttribute (203002, 2, 0x00000042, 1),
+                                                              makeNoteOn (0, 61, 1.0f, 2, 1),
+                                                              makeNoteOn (0, 62, 1.0f, 3, 2),
+                                                              makeNoteOnAttribute (203001, 3, 0x0001, 2),
+                                                              makeNoteOnAttribute (203003, 3, 0x0002, 2),
+                                                              makeNoteOn (0, 63, 1.0f, 4, 3),
+                                                              makeNoteOnAttribute (203000, 4, 0x0003, 3),
+                                                              makeNoteOnAttribute (204003, 4, 0x0004, 3),
+                                                              makeNoteOn (0, 64, 1.0f, -1, 4),
+                                                              makeNoteOnAttribute (203003, -1, 0x0005, 4) };
+
+            UMPBuffer expected2;
+            addPacket (expected2, ump::Factory::makeNoteOnV2 (0, 0, 60, pitch7_9, 0xffff, 0xabcd), 0);
+            addPacket (expected2, ump::Factory::makeNoteOnV2 (0, 0, 61, profile, 0xffff, 0x0042), 1);
+            addPacket (expected2, ump::Factory::makeNoteOnV2 (0, 0, 62, pitch7_9, 0xffff, 0x0002), 2);
+            addPacket (expected2, ump::Factory::makeNoteOnV2 (0, 0, 63, none, 0xffff, 0), 3);
+            addPacket (expected2, ump::Factory::makeNoteOnV2 (0, 0, 64, none, 0xffff, 0), 4);
+
+            expect (toPackets (ump::PacketProtocol::MIDI_2_0, events).data == expected2.data);
+
+            UMPBuffer expected1;
+
+            for (auto i = 0; i < 5; ++i)
+                addPacket (expected1, ump::Factory::makeNoteOnV1 (0, 0, (uint8_t) (60 + i), 127), i);
+
+            expect (toPackets (ump::PacketProtocol::MIDI_1_0, events).data == expected1.data);
+        }
+       #endif
+
         beginTest ("UMPConverter sends no more than 2048 events to the host at once");
         {
             UMPBuffer packets;
@@ -1324,6 +1362,20 @@ private:
         e.noteExpressionValue.value = value;
         return e;
     }
+
+   #if JUCE_VST3_MIDI2_NOTE_ON_ATTRIBUTES
+    static Steinberg::Vst::Event makeNoteOnAttribute (Steinberg::Vst::NoteExpressionTypeID typeId,
+                                                      int noteId,
+                                                      Steinberg::uint64 value,
+                                                      int sampleOffset)
+    {
+        auto e = makeEvent (Steinberg::Vst::Event::kNoteExpressionIntValueEvent, sampleOffset);
+        e.noteExpressionIntValue.typeId = typeId;
+        e.noteExpressionIntValue.noteId = noteId;
+        e.noteExpressionIntValue.value = value;
+        return e;
+    }
+   #endif
 
     static Steinberg::Vst::Event makeLegacyController (int channel,
                                                        int number,

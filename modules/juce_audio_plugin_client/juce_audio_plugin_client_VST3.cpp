@@ -836,6 +836,9 @@ static void setValueAndNotifyIfChanged (AudioProcessorParameter& param, float ne
 //==============================================================================
 class JuceVST3EditController final : public Vst::EditController,
                                      public Vst::IMidiMapping,
+                                    #if JUCE_VST3_MIDI2_NOTE_ON_ATTRIBUTES
+                                     public Vst::INoteExpressionController,
+                                    #endif
                                      public Vst::IUnitInfo,
                                      public Vst::IRemapParamID,
                                      public Vst::ChannelContext::IInfoListener,
@@ -871,6 +874,12 @@ public:
         const auto userProvidedInterface = queryAdditionalInterfaces (getPluginInstance(),
                                                                       targetIID,
                                                                       &VST3ClientExtensions::queryIEditController);
+
+       #if JUCE_VST3_MIDI2_NOTE_ON_ATTRIBUTES
+        // The plug-in's own INoteExpressionController takes the place of the one that declares no types
+        if (userProvidedInterface.isOk() && doUIDsMatch (targetIID, Vst::INoteExpressionController::iid))
+            return userProvidedInterface.extract (obj);
+       #endif
 
         const auto juceProvidedInterface = queryInterfaceInternal (targetIID);
 
@@ -1292,6 +1301,42 @@ public:
                                            static_cast<Vst::ParamID> (numElementsInArray (parameterToMidiController))));
     }
 
+   #if JUCE_VST3_MIDI2_NOTE_ON_ATTRIBUTES
+    //==============================================================================
+    // The host owns the types of note expression that carry MIDI 2.0 note-on attributes, so the plug-in
+    // declares none of its own, but it implements this so that the host sends it note expression
+    Steinberg::int32 PLUGIN_API getNoteExpressionCount (Steinberg::int32, Steinberg::int16) override
+    {
+        return 0;
+    }
+
+    tresult PLUGIN_API getNoteExpressionInfo (Steinberg::int32,
+                                              Steinberg::int16,
+                                              Steinberg::int32,
+                                              Vst::NoteExpressionTypeInfo&) override
+    {
+        return kResultFalse;
+    }
+
+    tresult PLUGIN_API getNoteExpressionStringByValue (Steinberg::int32,
+                                                       Steinberg::int16,
+                                                       Vst::NoteExpressionTypeID,
+                                                       Vst::NoteExpressionValue,
+                                                       Vst::String128) override
+    {
+        return kResultFalse;
+    }
+
+    tresult PLUGIN_API getNoteExpressionValueByString (Steinberg::int32,
+                                                       Steinberg::int16,
+                                                       Vst::NoteExpressionTypeID,
+                                                       const Vst::TChar*,
+                                                       Vst::NoteExpressionValue&) override
+    {
+        return kResultFalse;
+    }
+   #endif
+
     //==============================================================================
     Steinberg::int32 PLUGIN_API getUnitCount() override
     {
@@ -1689,6 +1734,9 @@ private:
                                              UniqueBase<Vst::IEditController2>{},
                                              UniqueBase<Vst::IConnectionPoint>{},
                                              UniqueBase<Vst::IMidiMapping>{},
+                                            #if JUCE_VST3_MIDI2_NOTE_ON_ATTRIBUTES
+                                             UniqueBase<Vst::INoteExpressionController>{},
+                                            #endif
                                              UniqueBase<Vst::IUnitInfo>{},
                                              UniqueBase<Vst::IRemapParamID>{},
                                              UniqueBase<Vst::ChannelContext::IInfoListener>{},

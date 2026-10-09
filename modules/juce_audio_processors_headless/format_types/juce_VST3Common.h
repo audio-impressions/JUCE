@@ -1604,6 +1604,18 @@ private:
 };
 
 //==============================================================================
+/*  Fork only. A VST3 SDK that hasn't been released yet has hosts send the attribute of a MIDI 2.0
+    note-on as integer note expression, with a type ID between 203000 and 203255. Enabling this puts
+    those attributes in the note-ons that a processor using the MIDI 2.0 protocol receives. Unless the
+    plug-in provides its own through VST3ClientExtensions, the edit controller also implements an
+    INoteExpressionController that declares no types, which a host needs before it sends any note
+    expression. This can go once the SDK defines these type IDs.
+*/
+#ifndef JUCE_VST3_MIDI2_NOTE_ON_ATTRIBUTES
+ #define JUCE_VST3_MIDI2_NOTE_ON_ATTRIBUTES 0
+#endif
+
+//==============================================================================
 /*  Converts between the events that a VST3 host exchanges with a plug-in and the Universal MIDI
     Packets of a plug-in whose AudioProcessor receives its MIDI in a UMPBuffer.
 
@@ -1643,6 +1655,10 @@ public:
     /*  Adds a packet for each event that the processor's protocol can represent. */
     void toUMPBuffer (UMPBuffer& result, Steinberg::Vst::IEventList& eventList)
     {
+       #if JUCE_VST3_MIDI2_NOTE_ON_ATTRIBUTES
+        collectNoteOnAttributes (eventList);
+       #endif
+
         const auto numEvents = eventList.getEventCount();
 
         for (Steinberg::int32 i = 0; i < numEvents; ++i)
@@ -1888,8 +1904,19 @@ private:
                     keysWithControllers[getKeyIndex (channel, key)] = false;
                 }
 
-                addPacket (ump::Factory::makeNoteOnV2 (0, channel, key, ump::Factory::NoteAttributeKind::none,
-                                                       denormaliseTo16Bit (velocity), 0));
+                auto attribute = ump::Factory::NoteAttributeKind::none;
+                uint16_t attributeData = 0;
+
+               #if JUCE_VST3_MIDI2_NOTE_ON_ATTRIBUTES
+                if (const auto* found = findNoteOnAttribute (e.noteOn.noteId))
+                {
+                    attribute = found->kind;
+                    attributeData = found->data;
+                }
+               #endif
+
+                addPacket (ump::Factory::makeNoteOnV2 (0, channel, key, attribute,
+                                                       denormaliseTo16Bit (velocity), attributeData));
                 return;
             }
 
@@ -2111,6 +2138,88 @@ private:
     {
         return (uint32_t) std::round (jlimit (0.0, 4294967295.0, value * 4294967295.0));
     }
+
+   #if JUCE_VST3_MIDI2_NOTE_ON_ATTRIBUTES
+    struct NoteOnAttribute
+    {
+        Steinberg::int32 noteId;
+        ump::Factory::NoteAttributeKind kind;
+        uint16_t data;
+    };
+
+    // The attribute's type is the type ID minus the first of these, and its data is in the lower 16 bits of the value
+    static constexpr Steinberg::Vst::NoteExpressionTypeID firstNoteOnAttributeTypeId = 203000;
+    static constexpr Steinberg::Vst::NoteExpressionTypeID lastNoteOnAttributeTypeId  = 203255;
+
+    /*  Finds the attributes that the host sends for the note-ons in a block before the note-ons are
+        converted, as the host may send them after their note-ons. A note-on carries one attribute,
+        so the last one for each note ID is used, and an attribute that arrives in a later block than
+        its note-on is lost.
+    */
+    void collectNoteOnAttributes (Steinberg::Vst::IEventList& eventList)
+    {
+        numNoteOnAttributes = 0;
+
+        if (protocol != ump::PacketProtocol::MIDI_2_0)
+            return;
+
+        const auto numEvents = eventList.getEventCount();
+
+        for (Steinberg::int32 i = 0; i < numEvents; ++i)
+        {
+            Steinberg::Vst::Event e;
+
+            if (eventList.getEvent (i, e) != Steinberg::kResultOk
+                || e.type != Steinberg::Vst::Event::kNoteExpressionIntValueEvent)
+                continue;
+
+            const auto& expression = e.noteExpressionIntValue;
+
+            // The first type ID is for a note-on without an attribute
+            if (expression.noteId == -1
+                || expression.typeId <= firstNoteOnAttributeTypeId
+                || expression.typeId > lastNoteOnAttributeTypeId)
+                continue;
+
+            const auto kind = (uint8_t) (expression.typeId - firstNoteOnAttributeTypeId);
+            const NoteOnAttribute attribute { expression.noteId,
+                                              ump::Factory::NoteAttributeKind (kind),
+                                              (uint16_t) (expression.value & 0xffff) };
+
+            const auto matchesNote = [&] (const NoteOnAttribute& a) { return a.noteId == attribute.noteId; };
+            const auto begin = noteOnAttributes.begin();
+            const auto end = begin + (std::ptrdiff_t) numNoteOnAttributes;
+            const auto iter = std::find_if (begin, end, matchesNote);
+
+            if (iter != end)
+            {
+                *iter = attribute;
+                continue;
+            }
+
+            // If this is hit, more note-ons in a block have attributes than there's room for, and the rest lose theirs
+            jassert (numNoteOnAttributes < noteOnAttributes.size());
+
+            if (numNoteOnAttributes < noteOnAttributes.size())
+                noteOnAttributes[numNoteOnAttributes++] = attribute;
+        }
+    }
+
+    const NoteOnAttribute* findNoteOnAttribute (Steinberg::int32 noteId) const
+    {
+        if (noteId == -1)
+            return nullptr;
+
+        const auto begin = noteOnAttributes.begin();
+        const auto end = begin + (std::ptrdiff_t) numNoteOnAttributes;
+        const auto iter = std::find_if (begin, end, [&] (const NoteOnAttribute& a) { return a.noteId == noteId; });
+
+        return iter != end ? &*iter : nullptr;
+    }
+
+    std::array<NoteOnAttribute, 256> noteOnAttributes {};
+    size_t numNoteOnAttributes = 0;
+   #endif
 
     // The option flags of Per-Note Management that detach the per-note controllers from the notes
     // already on a key (D), and reset them to their defaults (S)
