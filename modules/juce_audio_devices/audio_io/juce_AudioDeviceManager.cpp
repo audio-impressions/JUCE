@@ -1206,6 +1206,11 @@ void AudioDeviceManager::setMidiInputDeviceEnabled (const String& identifier, bo
         {
             if (auto midiIn = MidiInput::openDevice (identifier, callbackHandler->getMidiInputCallback()))
             {
+                // Each consumer is added once, using its most recent registration that matches this input
+                for (const auto& info : midiConsumers)
+                    if (findMidiConsumerInfo (*info.consumer, identifier) == &info)
+                        midiIn->addConsumer (*info.consumer, info.protocol);
+
                 enabledMidiInputs.push_back (std::move (midiIn));
                 enabledMidiInputs.back()->start();
             }
@@ -1254,6 +1259,64 @@ void AudioDeviceManager::removeMidiInputDeviceCallback (const String& identifier
             midiCallbacks.remove (i);
         }
     }
+}
+
+void AudioDeviceManager::addMidiInputDeviceConsumer (const String& identifier,
+                                                     ump::Consumer& consumerToAdd,
+                                                     ump::PacketProtocol wanted)
+{
+    JUCE_ASSERT_MESSAGE_THREAD
+
+    const auto isSameRegistration = [&] (const MidiConsumerInfo& info)
+    {
+        return info.consumer == &consumerToAdd && info.deviceIdentifier == identifier;
+    };
+
+    midiConsumers.erase (std::remove_if (midiConsumers.begin(), midiConsumers.end(), isSameRegistration),
+                         midiConsumers.end());
+
+    midiConsumers.push_back ({ identifier, &consumerToAdd, wanted });
+
+    for (auto& input : enabledMidiInputs)
+        if (identifier.isEmpty() || input->getIdentifier() == identifier)
+            input->addConsumer (consumerToAdd, wanted);
+}
+
+void AudioDeviceManager::removeMidiInputDeviceConsumer (const String& identifier, ump::Consumer& consumerToRemove)
+{
+    JUCE_ASSERT_MESSAGE_THREAD
+
+    const auto isSameRegistration = [&] (const MidiConsumerInfo& info)
+    {
+        return info.consumer == &consumerToRemove && info.deviceIdentifier == identifier;
+    };
+
+    midiConsumers.erase (std::remove_if (midiConsumers.begin(), midiConsumers.end(), isSameRegistration),
+                         midiConsumers.end());
+
+    for (auto& input : enabledMidiInputs)
+    {
+        if (identifier.isNotEmpty() && input->getIdentifier() != identifier)
+            continue;
+
+        // A consumer with other registrations that match this input keeps the most recent one
+        if (const auto* remaining = findMidiConsumerInfo (consumerToRemove, input->getIdentifier()))
+            input->addConsumer (consumerToRemove, remaining->protocol);
+        else
+            input->removeConsumer (consumerToRemove);
+    }
+}
+
+const AudioDeviceManager::MidiConsumerInfo* AudioDeviceManager::findMidiConsumerInfo (const ump::Consumer& consumer,
+                                                                                      const String& identifier) const
+{
+    const auto iter = std::find_if (midiConsumers.rbegin(), midiConsumers.rend(), [&] (const MidiConsumerInfo& info)
+    {
+        return info.consumer == &consumer
+               && (info.deviceIdentifier.isEmpty() || info.deviceIdentifier == identifier);
+    });
+
+    return iter != midiConsumers.rend() ? &*iter : nullptr;
 }
 
 void AudioDeviceManager::handleIncomingMidiMessageInt (MidiInput* source, const MidiMessage& message)

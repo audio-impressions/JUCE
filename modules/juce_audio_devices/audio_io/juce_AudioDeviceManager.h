@@ -330,9 +330,9 @@ public:
         The list of devices can be obtained with the MidiInput::getAvailableDevices() method.
 
         Any incoming messages from enabled input devices will be forwarded on to all the
-        listeners that have been registered with the addMidiInputDeviceCallback() method. They
-        can either register for messages from a particular device, or from just the "default"
-        midi input.
+        listeners and consumers that have been registered with the addMidiInputDeviceCallback()
+        and addMidiInputDeviceConsumer() methods. They can either register for messages from a
+        particular device, or from just the "default" midi input.
 
         Routing the midi input via an AudioDeviceManager means that when a listener
         registers for the default midi input, this default device can be changed by the
@@ -342,7 +342,7 @@ public:
         or not present, so that when the input is re-enabled, the listener will start
         receiving messages again.
 
-        @see addMidiInputDeviceCallback, isMidiInputDeviceEnabled
+        @see addMidiInputDeviceCallback, addMidiInputDeviceConsumer, isMidiInputDeviceEnabled
     */
     void setMidiInputDeviceEnabled (const String& deviceIdentifier, bool enabled);
 
@@ -368,6 +368,48 @@ public:
     /** Removes a listener that was previously registered with addMidiInputDeviceCallback(). */
     void removeMidiInputDeviceCallback (const String& deviceIdentifier,
                                         MidiInputCallback* callback);
+
+    /** Registers a consumer for the Universal MIDI Packets that arrive from a MIDI input, in the
+        protocol given by `wanted`.
+
+        The device identifier can be empty to indicate that it wants to receive the packets from
+        all the enabled MIDI inputs, or it can be the identifier of one of the MIDI input devices
+        if it just wants the packets from that device.
+
+        Only devices which are enabled (see the setMidiInputDeviceEnabled() method) will have their
+        packets forwarded on to consumers, but a consumer can be registered for a device before it
+        is enabled. A device that can't provide the protocol given by `wanted` passes on MIDI 1.0
+        instead, so consumers must accept MIDI 1.0 packets whatever protocol they ask for, and a
+        packet that arrives while a registration changes a consumer's protocol may be missed or
+        passed on twice.
+
+        Consumers are called directly by each device, without the lock returned by
+        getMidiCallbackLock() and without any indication of the device, so a consumer registered
+        for all the inputs may be called from several devices at once, with their packets
+        interleaved. Register it for each device when the source matters. Unlike the listeners
+        registered with addMidiInputDeviceCallback(), consumers also receive any active sense
+        messages.
+
+        Registering a consumer again for the same identifier replaces its previous registration,
+        and a device that matches more than one of a consumer's registrations uses the most recent.
+        This must be called on the message thread, and never from within ump::Consumer::consume().
+
+        @see removeMidiInputDeviceConsumer
+    */
+    void addMidiInputDeviceConsumer (const String& deviceIdentifier,
+                                     ump::Consumer& consumer,
+                                     ump::PacketProtocol wanted);
+
+    /** Removes a consumer that was previously registered with addMidiInputDeviceConsumer().
+
+        After the last of a consumer's registrations has been removed, it will not be called again.
+        If the consumer is being called by a device that it is removed from, this function waits
+        for that call to return.
+
+        This must be called on the message thread, and never from within ump::Consumer::consume().
+    */
+    void removeMidiInputDeviceConsumer (const String& deviceIdentifier,
+                                        ump::Consumer& consumer);
 
     //==============================================================================
     /** Sets a midi output device to use as the default.
@@ -525,9 +567,17 @@ private:
         MidiInputCallback* callback;
     };
 
+    struct MidiConsumerInfo
+    {
+        String deviceIdentifier;
+        ump::Consumer* consumer;
+        ump::PacketProtocol protocol;
+    };
+
     Array<MidiDeviceInfo> midiDeviceInfosFromXml;
     std::vector<std::unique_ptr<MidiInput>> enabledMidiInputs;
     Array<MidiCallbackInfo> midiCallbacks;
+    std::vector<MidiConsumerInfo> midiConsumers;
 
     MidiDeviceInfo defaultMidiOutputDeviceInfo;
     std::unique_ptr<MidiOutput> defaultMidiOutput;
@@ -573,6 +623,7 @@ private:
     String initialiseFromXML (const XmlElement&, bool selectDefaultDeviceOnFailure,
                               const String& preferredDefaultDeviceName, const AudioDeviceSetup*);
     void openLastRequestedMidiDevices (const Array<MidiDeviceInfo>&, const MidiDeviceInfo&);
+    const MidiConsumerInfo* findMidiConsumerInfo (const ump::Consumer&, const String& deviceIdentifier) const;
 
     AudioIODeviceType* findType (const String& inputName, const String& outputName);
     AudioIODeviceType* findType (const String& typeName);
