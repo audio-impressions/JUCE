@@ -81,6 +81,7 @@
 #include "midi/juce_MidiMessage.cpp"
 #include "midi/juce_MidiMessageSequence.cpp"
 #include "midi/juce_MidiRPN.cpp"
+#include "midi/juce_UMPBuffer.cpp"
 #include "mpe/juce_MPEValue.cpp"
 #include "mpe/juce_MPENote.cpp"
 #include "mpe/juce_MPEZoneLayout.cpp"
