@@ -130,6 +130,18 @@
  #define JUCE_CUSTOM_VST3_SDK 0
 #endif
 
+/** Config: JUCE_VST3_MIDI2_NOTE_ON_ATTRIBUTES
+    Fork only. Hosts built with an unreleased VST3 SDK send the attribute of a MIDI 2.0 note-on as
+    integer note expression, with a type ID between 203000 and 203255. If enabled, a processor that
+    uses the MIDI 2.0 protocol receives those attributes in its note-ons. Unless the plugin provides
+    its own through VST3ClientExtensions, the edit controller also implements an
+    INoteExpressionController that declares no types, which a host needs before it sends any note
+    expression. This can go once the SDK defines these type IDs.
+*/
+#ifndef JUCE_VST3_MIDI2_NOTE_ON_ATTRIBUTES
+ #define JUCE_VST3_MIDI2_NOTE_ON_ATTRIBUTES 0
+#endif
+
 //==============================================================================
 #include <juce_audio_processors_headless/format/juce_PluginFormatDefs.h>
 #include <juce_audio_processors_headless/processors/juce_AudioProcessorListener.h>
