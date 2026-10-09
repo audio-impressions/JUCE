@@ -637,6 +637,75 @@ MidiDeviceInfo MidiOutput::getDeviceInfo() const noexcept
     return customName.has_value() ? storedInfo.withName (*customName) : storedInfo;
 }
 
+/*  Returns a copy of a packet that is moved to the given group, unless it's a message that has no
+    group.
+*/
+static std::array<uint32_t, 4> copyPacketToGroup (ump::View packet, uint8_t group)
+{
+    std::array<uint32_t, 4> result {};
+    std::copy (packet.begin(), packet.end(), result.begin());
+
+    if (ump::Utils::hasGroup (ump::Utils::getMessageType (result[0])))
+        result[0] = ump::Utils::U4<1>::set (result[0], group);
+
+    return result;
+}
+
+bool MidiOutput::sendMessageNow (ump::View packet)
+{
+    const auto copy = copyPacketToGroup (packet, group);
+    const ump::Iterator iterator { copy.data(), copy.size() };
+    return connection.send (iterator, std::next (iterator));
+}
+
+bool MidiOutput::sendBlockOfMessagesNow (const UMPBuffer& buffer)
+{
+    mainPackets.clear();
+
+    for (const auto metadata : buffer)
+    {
+        const auto copy = copyPacketToGroup (metadata.packet, group);
+        mainPackets.add (ump::View (copy.data()));
+    }
+
+    return connection.send (mainPackets.begin(), mainPackets.end());
+}
+
+void MidiOutput::sendBlockOfMessages (const UMPBuffer& buffer,
+                                      double millisecondCounterToStartAt,
+                                      double samplesPerSecondForBuffer)
+{
+    // This needs to be a value in the future - check the documentation for this function!
+    jassert (millisecondCounterToStartAt > 0);
+
+    addScheduledMessages (outputThread, buffer, group, millisecondCounterToStartAt, samplesPerSecondForBuffer);
+}
+
+MidiOutput::ScheduledMessage MidiOutput::makeScheduledMessage (const MidiMessageMetadata& message,
+                                                               uint8_t groupToUse,
+                                                               uint32_t time)
+{
+    ScheduledMessage result { time, {}, {} };
+    auto isFirstPacket = true;
+
+    ump::ToUMP1Converter{}.convert ({ groupToUse, message.asSpan() }, [&] (const ump::View& view)
+    {
+        if (std::exchange (isFirstPacket, false))
+            std::copy (view.begin(), view.end(), result.firstPacket.begin());
+        else
+            result.otherPackets.add (view);
+    });
+
+    return result;
+}
+
+MidiOutput::ScheduledMessage MidiOutput::makeScheduledMessage (const UMPPacketMetadata& metadata,
+                                                               uint8_t groupToUse,
+                                                               uint32_t time)
+{
+    return { time, copyPacketToGroup (metadata.packet, groupToUse), {} };
+}
+
 bool MidiDeviceInfo::operator== (const MidiDeviceInfo& other) const noexcept
 {
     const auto tie = [] (auto& x) { return std::tuple (x.name, x.identifier); };

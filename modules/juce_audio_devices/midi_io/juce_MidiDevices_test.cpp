@@ -278,4 +278,187 @@ private:
 
 static MidiInputConnectionAdapterTests midiInputConnectionAdapterTests;
 
+class MidiOutputSchedulingTests final : public UnitTest
+{
+public:
+    MidiOutputSchedulingTests()
+        : UnitTest ("MidiOutput scheduling", UnitTestCategories::midi)
+    {
+    }
+
+    void runTest() override
+    {
+        testCase ("Each MIDI message is scheduled as the packets that are sent for it", [&]
+        {
+            const uint8_t longSysEx[] { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+            const uint8_t shortSysEx[] { 0x01, 0x02, 0x03 };
+
+            MidiBuffer buffer;
+            buffer.addEvent (MidiMessage (0x90, 0x3c, 0x64), 0);
+            buffer.addEvent (MidiMessage::createSysExMessage (longSysEx, (int) std::size (longSysEx)), 0);
+            buffer.addEvent (MidiMessage::createSysExMessage (shortSysEx, (int) std::size (shortSysEx)), 0);
+            buffer.addEvent (MidiMessage (0xf8), 0);
+            buffer.addEvent (MidiMessage (0x80, 0x3c, 0x40), 0);
+
+            // A SysEx message that takes several packets is held as a single message, so that its
+            // packets are sent together
+            expect (getWords (schedule (buffer, 3)) == Messages { { 0x23903c64 },
+                                                                  { 0x33160102, 0x03040506, 0x33320708, 0x00000000 },
+                                                                  { 0x33030102, 0x03000000 },
+                                                                  { 0x13f80000 },
+                                                                  { 0x23803c40 } });
+        });
+
+        testCase ("Each packet is scheduled on its own, on the output's group", [&]
+        {
+            UMPBuffer buffer;
+            addPacket (buffer, { 0x40903c00, 0xc9240000 }, 0);
+            addPacket (buffer, { 0x25b00740 }, 0);
+            addPacket (buffer, { 0x30160102, 0x03040506 }, 0);
+            addPacket (buffer, { 0x30320708, 0x00000000 }, 0);
+
+            expect (getWords (schedule (buffer, 2)) == Messages { { 0x42903c00, 0xc9240000 },
+                                                                  { 0x22b00740 },
+                                                                  { 0x32160102, 0x03040506 },
+                                                                  { 0x32320708, 0x00000000 } });
+        });
+
+        testCase ("Utility and stream messages are scheduled unchanged", [&]
+        {
+            const Words jrTimestamp { 0x00201234 };
+            const Words endpointDiscovery { 0xf0000101, 0x0000001f, 0x00000000, 0x00000000 };
+
+            UMPBuffer buffer;
+            addPacket (buffer, jrTimestamp, 0);
+            addPacket (buffer, endpointDiscovery, 0);
+
+            expect (getWords (schedule (buffer, 2)) == Messages { jrTimestamp, endpointDiscovery });
+        });
+
+        testCase ("Sample positions are converted to the same times for messages and packets", [&]
+        {
+            MidiBuffer messages;
+            UMPBuffer packets;
+
+            for (const auto position : { 0, 24, 48, 4800 })
+            {
+                messages.addEvent (MidiMessage (0xf8), position);
+                addPacket (packets, { 0x10f80000 }, position);
+            }
+
+            // The times are truncated to whole milliseconds
+            const std::vector<uint32_t> expected { 1000, 1000, 1001, 1100 };
+
+            expect (getTimes (schedule (messages, 0, 1000.25, 48000.0)) == expected);
+            expect (getTimes (schedule (packets, 0, 1000.25, 48000.0)) == expected);
+        });
+
+        testCase ("Messages and packets share a queue, which returns them in time order", [&]
+        {
+            struct LocalTimeProvider
+            {
+                uint32_t getMillisecondCounter() const { return 1000; }
+            };
+
+            LocalTimeProvider timeProvider;
+            ScheduledEventQueue<ScheduledMessage, LocalTimeProvider> queue { &timeProvider };
+
+            MidiBuffer messages;
+            messages.addEvent (MidiMessage (0x90, 0x3c, 0x64), 96);
+            messages.addEvent (MidiMessage (0x90, 0x3d, 0x64), 0);
+
+            UMPBuffer packets;
+            addPacket (packets, { 0x40903e00, 0xc9240000 }, 48);
+            addPacket (packets, { 0x40903f00, 0xc9240000 }, 0);
+
+            MidiOutput::addScheduledMessages (queue, messages, 0, 1000.5, 48000.0);
+            MidiOutput::addScheduledMessages (queue, packets, 0, 1000.5, 48000.0);
+
+            Messages popped;
+
+            for (;;)
+            {
+                const auto event = queue.popEvent (1000);
+                const auto* message = std::get_if<ScheduledMessage> (&event);
+
+                if (message == nullptr)
+                    break;
+
+                popped.push_back (getWords (*message));
+            }
+
+            // Messages that are due at the same time leave the queue in the order they were added
+            expect (popped == Messages { { 0x20903d64 },
+                                         { 0x40903f00, 0xc9240000 },
+                                         { 0x40903e00, 0xc9240000 },
+                                         { 0x20903c64 } });
+        });
+    }
+
+private:
+    using ScheduledMessage = MidiOutput::ScheduledMessage;
+    using Words = std::vector<uint32_t>;
+    using Messages = std::vector<Words>;
+
+    struct Recorder
+    {
+        void addEvent (const ScheduledMessage& message)
+        {
+            messages.push_back (message);
+        }
+
+        std::vector<ScheduledMessage> messages;
+    };
+
+    static void addPacket (UMPBuffer& buffer, const Words& words, int position)
+    {
+        buffer.addPacket (Span (words.data(), words.size()), position);
+    }
+
+    /*  Returns the messages that the output's background thread would be given for `buffer`. */
+    template <typename Buffer>
+    static std::vector<ScheduledMessage> schedule (const Buffer& buffer,
+                                                   uint8_t group,
+                                                   double millisecondCounterToStartAt = 1000.0,
+                                                   double samplesPerSecond = 48000.0)
+    {
+        Recorder recorder;
+        MidiOutput::addScheduledMessages (recorder, buffer, group, millisecondCounterToStartAt, samplesPerSecond);
+        return recorder.messages;
+    }
+
+    static Words getWords (const ScheduledMessage& message)
+    {
+        const ump::View firstPacket { message.firstPacket.data() };
+        Words words (firstPacket.begin(), firstPacket.end());
+
+        for (const auto& view : message.otherPackets)
+            words.insert (words.end(), view.begin(), view.end());
+
+        return words;
+    }
+
+    static Messages getWords (const std::vector<ScheduledMessage>& messages)
+    {
+        Messages result;
+
+        for (const auto& message : messages)
+            result.push_back (getWords (message));
+
+        return result;
+    }
+
+    static std::vector<uint32_t> getTimes (const std::vector<ScheduledMessage>& messages)
+    {
+        std::vector<uint32_t> result;
+
+        for (const auto& message : messages)
+            result.push_back (message.timeStamp);
+
+        return result;
+    }
+};
+
+static MidiOutputSchedulingTests midiOutputSchedulingTests;
+
 } // namespace juce

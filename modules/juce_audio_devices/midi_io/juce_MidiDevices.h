@@ -348,7 +348,10 @@ public:
 
 //==============================================================================
 /**
-    Represents a midi output device using the old bytestream format.
+    Represents a midi output device.
+
+    Messages can be sent as MidiMessage objects, using the old bytestream format, or as Universal
+    MIDI Packets.
 
     To create one of these, use the static getAvailableDevices() method to find out what
     outputs are available, and then use the openDevice() method to try to open one.
@@ -432,11 +435,26 @@ public:
         return convertAndSend (mainPackets, Span { &message, 1 });
     }
 
+    /** Sends out a Universal MIDI Packet immediately.
+
+        The packet is sent in the protocol that it uses, on this output's group (see getGroup()).
+        If the device uses MIDI 1.0, a MIDI 2.0 message is translated on its way to the device,
+        losing any detail that MIDI 1.0 can't express. Packets that have no group, such as utility
+        messages, are sent unchanged.
+    */
+    bool sendMessageNow (ump::View packet);
+
     /** Sends out a sequence of MIDI messages immediately. */
     bool sendBlockOfMessagesNow (const MidiBuffer& buffer)
     {
         return convertAndSend (mainPackets, buffer);
     }
+
+    /** Sends out a sequence of Universal MIDI Packets immediately.
+
+        Each packet is sent in the same way as by sendMessageNow (ump::View).
+    */
+    bool sendBlockOfMessagesNow (const UMPBuffer& buffer);
 
     /** This lets you supply a block of messages that will be sent out at some point
         in the future.
@@ -462,15 +480,20 @@ public:
         // This needs to be a value in the future - check the documentation for this function!
         jassert (millisecondCounterToStartAt > 0);
 
-        const auto timeScaleFactor = 1000.0 / samplesPerSecondForBuffer;
-
-        for (const auto item : buffer)
-        {
-            auto msg = item.getMessage();
-            msg.setTimeStamp (millisecondCounterToStartAt + timeScaleFactor * msg.getTimeStamp());
-            outputThread.addEvent (msg);
-        }
+        addScheduledMessages (outputThread, buffer, group, millisecondCounterToStartAt, samplesPerSecondForBuffer);
     }
+
+    /** This lets you supply a block of Universal MIDI Packets that will be sent out at some
+        point in the future.
+
+        This works in the same way as the MidiBuffer version of sendBlockOfMessages(), so the
+        background thread must have been started with startBackgroundThread(), and the sample
+        position of each packet is converted to a real time using samplesPerSecondForBuffer.
+        Each packet is sent in the same way as by sendMessageNow (ump::View).
+    */
+    void sendBlockOfMessages (const UMPBuffer& buffer,
+                              double millisecondCounterToStartAt,
+                              double samplesPerSecondForBuffer);
 
     /** Gets rid of any midi messages that had been added by sendBlockOfMessages().
     */
@@ -511,6 +534,24 @@ public:
     }
 
 private:
+   #if JUCE_UNIT_TESTS
+    friend class MidiOutputSchedulingTests;
+   #endif
+
+    /*  A message that is waiting to be sent by the background thread, as Universal MIDI Packets.
+        Most messages take a single packet, which is held without allocating. The other packets of
+        a longer message, such as a SysEx message, are held in otherPackets, so that the whole
+        message is sent at once.
+    */
+    struct ScheduledMessage
+    {
+        uint32_t getTimeStamp() const { return timeStamp; }
+
+        uint32_t timeStamp = 0;
+        std::array<uint32_t, 4> firstPacket {};
+        ump::Packets otherPackets;
+    };
+
     MidiOutput (std::shared_ptr<ump::Session>,
                 ump::Output,
                 uint8_t,
@@ -538,6 +579,28 @@ private:
         return connection.send (packets.begin(), packets.end());
     }
 
+    static ScheduledMessage makeScheduledMessage (const MidiMessageMetadata&, uint8_t groupToUse, uint32_t time);
+    static ScheduledMessage makeScheduledMessage (const UMPPacketMetadata&, uint8_t groupToUse, uint32_t time);
+
+    /*  Adds a ScheduledMessage to the queue for each item in the buffer, due at the time given by
+        the item's sample position.
+    */
+    template <typename Queue, typename Buffer>
+    static void addScheduledMessages (Queue& queue,
+                                      const Buffer& buffer,
+                                      uint8_t groupToUse,
+                                      double millisecondCounterToStartAt,
+                                      double samplesPerSecondForBuffer)
+    {
+        const auto timeScaleFactor = 1000.0 / samplesPerSecondForBuffer;
+
+        for (const auto item : buffer)
+        {
+            const auto time = (uint32_t) (millisecondCounterToStartAt + timeScaleFactor * item.samplePosition);
+            queue.addEvent (makeScheduledMessage (item, groupToUse, time));
+        }
+    }
+
     //==============================================================================
     std::shared_ptr<ump::Session> session;
     ump::LegacyVirtualOutput virtualEndpoint;
@@ -547,9 +610,15 @@ private:
     ump::Packets mainPackets, backgroundPackets;
     uint8_t group{};
     ListenerList<DisconnectionListener> disconnectionListeners;
-    ScheduledEventThread<MidiMessage> outputThread { [this] (const MidiMessage& message)
+    ScheduledEventThread<ScheduledMessage> outputThread { [this] (const ScheduledMessage& message)
     {
-        convertAndSend (backgroundPackets, Span { &message, 1 });
+        backgroundPackets.clear();
+        backgroundPackets.add (ump::View (message.firstPacket.data()));
+
+        for (const auto& view : message.otherPackets)
+            backgroundPackets.add (view);
+
+        connection.send (backgroundPackets.begin(), backgroundPackets.end());
     } };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiOutput)
