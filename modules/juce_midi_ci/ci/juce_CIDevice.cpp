@@ -1067,6 +1067,16 @@ private:
             device.profileHost->setProfileEnablement (profileAtAddress, enabled ? jmax (1, numChannels) : 0);
         }
 
+        std::optional<std::vector<std::byte>> profileDetailsRequested (MUID x,
+                                                                       ProfileAtAddress profileAtAddress,
+                                                                       std::byte target) override
+        {
+            if (auto* d = device.options.getProfileDelegate())
+                return d->profileDetailsRequested (x, profileAtAddress, target);
+
+            return std::nullopt;
+        }
+
     private:
         Impl& device;
     };
@@ -1805,6 +1815,83 @@ public:
                                                                                     {},
                                                                                     {},
                                                                                     {} }));
+        }
+
+        beginTest ("If a device receives a details inquiry message with a non-zero target and the profile delegate returns data, a details response containing that data is emitted");
+        {
+            struct ReturningDelegate : public ProfileDelegate
+            {
+                void profileEnablementRequested (MUID, ProfileAtAddress, int, bool) override {}
+
+                std::optional<std::vector<std::byte>> profileDetailsRequested (MUID,
+                                                                               ProfileAtAddress,
+                                                                               std::byte target) override
+                {
+                    // Echo the target byte alongside a recognisable payload so the
+                    // test can assert the delegate's value is routed back unchanged
+                    return std::vector<std::byte> { target, std::byte { 0x2b }, std::byte { 0x4d } };
+                }
+            };
+
+            ReturningDelegate delegate;
+            const auto features = DeviceFeatures{}.withProfileConfigurationSupported (true);
+            Output output;
+            const auto options = DeviceOptions().withOutputs ({ &output })
+                                                .withFunctionBlock (functionBlock)
+                                                .withDeviceInfo (deviceInfo)
+                                                .withMaxSysExSize (512)
+                                                .withFeatures (features)
+                                                .withProfileDelegate (&delegate);
+            Device device { options };
+
+            expect (device.getProfileHost() != nullptr);
+
+            const Profile profile { std::byte { 0x01 },
+                                    std::byte { 0x02 },
+                                    std::byte { 0x03 },
+                                    std::byte { 0x04 },
+                                    std::byte { 0x05 } };
+
+            const auto inquiryMUID = MUID::makeRandom (random);
+            const auto target      = std::byte { 0x01 };
+
+            const auto inquiry = getMessageBytes ({ ChannelInGroup::wholeBlock,
+                                                    detail::MessageMeta::Meta<Message::ProfileDetails>::subID2,
+                                                    detail::MessageMeta::implementationVersion,
+                                                    inquiryMUID,
+                                                    device.getMuid() },
+                                                  Message::ProfileDetails { profile, target });
+
+            // The delegate is only asked about a profile that is supported
+            device.processMessage ({ 0, inquiry });
+
+            expect (output.messages.size() == 1);
+            expect (output.messages.back().bytes == getMessageBytes ({ ChannelInGroup::wholeBlock,
+                                                                       detail::MessageMeta::Meta<Message::NAK>::subID2,
+                                                                       detail::MessageMeta::implementationVersion,
+                                                                       device.getMuid(),
+                                                                       inquiryMUID },
+                                                                     Message::NAK { detail::MessageMeta::Meta<Message::ProfileDetails>::subID2,
+                                                                                    std::byte { 0x04 },
+                                                                                    {},
+                                                                                    {},
+                                                                                    {} }));
+
+            device.getProfileHost()->addProfile ({ profile, ChannelAddress{}.withChannel (ChannelInGroup::wholeBlock) });
+            device.processMessage ({ 0, inquiry });
+
+            using ResponseMeta = detail::MessageMeta::Meta<Message::ProfileDetailsResponse>;
+            const std::vector<std::byte> payload { target, std::byte { 0x2b }, std::byte { 0x4d } };
+
+            expect (output.messages.size() == 2);
+            expect (output.messages.back().bytes == getMessageBytes ({ ChannelInGroup::wholeBlock,
+                                                                       ResponseMeta::subID2,
+                                                                       detail::MessageMeta::implementationVersion,
+                                                                       device.getMuid(),
+                                                                       inquiryMUID },
+                                                                     Message::ProfileDetailsResponse { profile,
+                                                                                                       target,
+                                                                                                       payload }));
         }
 
         beginTest ("If a device receives a set profile on and enables the profile, profile enabled report is emitted");

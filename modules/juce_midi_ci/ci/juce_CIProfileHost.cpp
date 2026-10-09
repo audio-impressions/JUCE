@@ -120,20 +120,30 @@ private:
 
     bool messageReceived (const Message::ProfileDetails& body) const
     {
+        const auto address = ChannelAddress{}.withGroup (output->getIncomingGroup())
+                                             .withChannel (output->getIncomingHeader().deviceID);
+        const ProfileAtAddress profileAtAddress { body.profile, address };
+
         if (body.target == std::byte{})
         {
-            const auto address = ChannelAddress{}.withGroup (output->getIncomingGroup())
-                                                 .withChannel (output->getIncomingHeader().deviceID);
-            const ProfileAtAddress profileAtAddress { body.profile, address };
             const auto state = host->getState (profileAtAddress);
             std::vector<std::byte> extraData;
             detail::Marshalling::Writer { extraData } (state.active, state.supported);
             detail::MessageTypeUtils::send (*output, Message::ProfileDetailsResponse { body.profile, body.target, extraData });
+            return true;
         }
+
+        // The reply to a non-zero target is defined by the profile, so only a supported profile can have one
+        const auto payload = host->getState (profileAtAddress).isSupported()
+                           ? host->delegate.profileDetailsRequested (output->getIncomingHeader().source,
+                                                                     profileAtAddress,
+                                                                     body.target)
+                           : std::nullopt;
+
+        if (payload.has_value())
+            detail::MessageTypeUtils::send (*output, Message::ProfileDetailsResponse { body.profile, body.target, *payload });
         else
-        {
             detail::MessageTypeUtils::sendNAK (*output, std::byte { 0x04 });
-        }
 
         return true;
     }

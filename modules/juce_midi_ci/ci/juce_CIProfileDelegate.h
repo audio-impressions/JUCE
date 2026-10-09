@@ -65,6 +65,24 @@ struct ProfileDelegate
                                              [[maybe_unused]] ProfileAtAddress profileAtAddress,
                                              [[maybe_unused]] int numChannels,
                                              [[maybe_unused]] bool enabled) = 0;
+
+    /** Called when a remote device sends a Profile Details Inquiry with a non-zero target
+        about a profile that is supported at the given address.
+
+        The meaning of the target is defined by each profile. Return the bytes to
+        send in the Message::ProfileDetailsResponse, or std::nullopt to reply with
+        a NAK, which is the default. Each byte must be a 7-bit value, and there must
+        be fewer than 16384 of them.
+
+        Inquiries with a target of zero are answered by the ProfileHost and never
+        reach this function.
+    */
+    virtual std::optional<std::vector<std::byte>> profileDetailsRequested ([[maybe_unused]] MUID x,
+                                                                           [[maybe_unused]] ProfileAtAddress profileAtAddress,
+                                                                           [[maybe_unused]] std::byte target)
+    {
+        return std::nullopt;
+    }
 };
 
 } // namespace juce::midi_ci
