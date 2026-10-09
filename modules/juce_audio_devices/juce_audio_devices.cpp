@@ -289,4 +289,5 @@ namespace juce
 
 #if JUCE_UNIT_TESTS
  #include "midi_io/juce_ScheduledEventThread_test.cpp"
+ #include "midi_io/juce_MidiDevices_test.cpp"
 #endif

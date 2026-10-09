@@ -64,20 +64,153 @@ static std::shared_ptr<ump::Session> getLegacySession()
     return nullptr;
 }
 
-class MidiInput::Impl : private ump::Consumer,
-                        private ump::DisconnectionListener
+//==============================================================================
+/*  The ump::Consumer attached to one of the connections of a MidiInput.
+
+    While it is active, it passes the packets for the input's group on to the ump::Consumer
+    objects that were added to it, with adjacent packets passed on together. The adapter for the
+    MIDI 1.0 connection also converts the packets to bytestream messages for the
+    MidiInputCallback listeners, in the same way that MidiInput always has.
+
+    The adapter holds no device state, so that it can be tested without a device.
+*/
+class MidiInputConnectionAdapter final : public ump::Consumer
+{
+public:
+    /*  Creates an adapter that only passes packets on to ump::Consumer objects. */
+    explicit MidiInputConnectionAdapter (uint8_t groupIn)
+        : group (groupIn)
+    {
+    }
+
+    /*  Creates an adapter that also passes bytestream messages to `callbacksIn`, giving
+        `sourceIn` as their source.
+    */
+    MidiInputConnectionAdapter (uint8_t groupIn,
+                                MidiInput* sourceIn,
+                                const WaitFreeListeners<MidiInputCallback>& callbacksIn)
+        : group (groupIn),
+          source (sourceIn),
+          callbacks (&callbacksIn),
+          converter (std::in_place, 4096)
+    {
+    }
+
+    void setActive (bool shouldBeActive)
+    {
+        const SpinLock::ScopedLockType lock { spinLock };
+        active = shouldBeActive;
+    }
+
+    /*  Must only be called on the message thread. Adding a consumer that is already present has
+        no effect.
+    */
+    void addConsumer (ump::Consumer& c)
+    {
+        consumers.add (c);
+    }
+
+    /*  Must only be called on the message thread. If `c` is being called, this waits for that
+        call to return.
+    */
+    void removeConsumer (ump::Consumer& c)
+    {
+        consumers.remove (c);
+    }
+
+    bool hasConsumers() const
+    {
+        return ! consumers.isEmpty();
+    }
+
+    void consume (ump::Iterator b, ump::Iterator e, double time) override
+    {
+        const SpinLock::ScopedTryLockType lock { spinLock };
+
+        if (! lock.isLocked() || ! active)
+            return;
+
+        if (callbacks != nullptr)
+        {
+            for (const auto& view : makeRange (b, e))
+            {
+                if (ump::Utils::getGroup (view[0]) != group)
+                    continue;
+
+                converter->convert (view, time, [this] (ump::BytesOnGroup v, double t)
+                {
+                    const MidiMessage msg { v.bytes.data(), (int) v.bytes.size(), t };
+
+                    callbacks->call ([&] (MidiInputCallback& l)
+                    {
+                        l.handleIncomingMidiMessage (source, msg);
+                    });
+                });
+            }
+        }
+
+        consumers.call ([&] (ump::Consumer& c)
+        {
+            forEachRunOnGroup (b, e, [&] (ump::Iterator first, ump::Iterator last)
+            {
+                c.consume (first, last, time);
+            });
+        });
+    }
+
+private:
+    /*  Calls `callback` with each run of adjacent packets in [b, e) that belong to this adapter's
+        group. Utility and stream messages have no group, so they are never passed on, just as
+        they never produce bytestream messages.
+    */
+    template <typename Callback>
+    void forEachRunOnGroup (ump::Iterator b, ump::Iterator e, Callback&& callback) const
+    {
+        const auto isOnGroup = [this] (const ump::View& view)
+        {
+            const auto firstWord = view[0];
+
+            return ump::Utils::hasGroup (ump::Utils::getMessageType (firstWord))
+                   && ump::Utils::getGroup (firstWord) == group;
+        };
+
+        for (auto it = b; it != e;)
+        {
+            const auto runStart = std::find_if (it, e, isOnGroup);
+            const auto runEnd = std::find_if_not (runStart, e, isOnGroup);
+
+            if (runStart != runEnd)
+                callback (runStart, runEnd);
+
+            it = runEnd;
+        }
+    }
+
+    uint8_t group{};
+    MidiInput* source = nullptr;
+    const WaitFreeListeners<MidiInputCallback>* callbacks = nullptr;
+    std::optional<ump::ToBytestreamConverter> converter;
+    WaitFreeListeners<ump::Consumer> consumers;
+    SpinLock spinLock;
+    bool active = false;
+
+    JUCE_DECLARE_NON_COPYABLE (MidiInputConnectionAdapter)
+};
+
+//==============================================================================
+class MidiInput::Impl : private ump::DisconnectionListener
 {
 public:
     void start()
     {
-        const SpinLock::ScopedLockType lock { spinLock };
-        active = true;
+        midi1Adapter.setActive (true);
+        midi2Adapter.setActive (true);
     }
 
     void stop()
     {
-        const SpinLock::ScopedLockType lock { spinLock };
-        active = false;
+        midi1Adapter.setActive (false);
+        midi2Adapter.setActive (false);
     }
 
     MidiDeviceInfo getDeviceInfo() const noexcept
@@ -100,8 +233,39 @@ public:
         callbacks.remove (cb);
     }
 
+    bool addConsumer (ump::Consumer& c, ump::PacketProtocol wanted)
+    {
+        JUCE_ASSERT_MESSAGE_THREAD
+
+        const auto useMidi2Connection = wanted == ump::PacketProtocol::MIDI_2_0 && openMidi2Connection();
+        auto& adapter = useMidi2Connection ? midi2Adapter : midi1Adapter;
+        auto& otherAdapter = useMidi2Connection ? midi1Adapter : midi2Adapter;
+
+        // Adding a consumer that is already present has no effect, so a consumer that stays on the
+        // same connection doesn't miss any packets
+        otherAdapter.removeConsumer (c);
+        adapter.addConsumer (c);
+
+        if (! midi2Adapter.hasConsumers())
+            closeMidi2Connection();
+
+        return useMidi2Connection || wanted == ump::PacketProtocol::MIDI_1_0;
+    }
+
+    void removeConsumer (ump::Consumer& c)
+    {
+        JUCE_ASSERT_MESSAGE_THREAD
+
+        midi1Adapter.removeConsumer (c);
+        midi2Adapter.removeConsumer (c);
+
+        if (! midi2Adapter.hasConsumers())
+            closeMidi2Connection();
+    }
+
     /*  session may be null, in which case it's up to the caller to ensure that the session lives
-        long enough for the connection to be useful.
+        long enough for the connection to be useful. Without a session, consumers that want
+        MIDI 2.0 are served from the MIDI 1.0 connection.
     */
     static std::unique_ptr<MidiInput> make (std::shared_ptr<ump::Session> session,
                                             ump::Input connection,
@@ -148,8 +312,9 @@ public:
 
     ~Impl() override
     {
+        closeMidi2Connection();
         connection.removeDisconnectionListener (*this);
-        connection.removeConsumer (*this);
+        connection.removeConsumer (midi1Adapter);
     }
 
 private:
@@ -161,37 +326,59 @@ private:
           ump::LegacyVirtualInput v)
         : session (s),
           virtualEndpoint (std::move (v)),
-          connection (std::move (x)),
           storedInfo (i),
           group (g),
-          owner (o)
+          midi1Adapter (g, o, callbacks),
+          midi2Adapter (g),
+          connection (std::move (x))
     {
-        connection.addConsumer (*this);
+        // The MidiInputCallback listeners are served from this connection, so it must use MIDI 1.0
+        jassert (connection.getProtocol() == ump::PacketProtocol::MIDI_1_0);
+
+        connection.addConsumer (midi1Adapter);
         connection.addDisconnectionListener (*this);
     }
 
-    void consume (ump::Iterator b, ump::Iterator e, double time) override
+    /*  Opens the MIDI 2.0 connection to the endpoint if it isn't open already, and returns true
+        if it is open afterwards.
+    */
+    bool openMidi2Connection()
     {
-        const SpinLock::ScopedTryLockType lock { spinLock };
+        if (midi2Connection.has_value())
+            return true;
 
-        if (! lock.isLocked() || ! active)
+        // A port made by createNewDevice() is MIDI 1.0 only, and not every backend can connect to it in MIDI 2.0
+        if (virtualEndpoint.isAlive())
+            return false;
+
+        if (session == nullptr)
+        {
+            // A second connection can't be opened without a session, so consumers that want
+            // MIDI 2.0 will be served from the MIDI 1.0 connection instead
+            jassertfalse;
+            return false;
+        }
+
+        if (! connection.isAlive())
+            return false;
+
+        auto newConnection = session->connectInput (connection.getEndpointId(), ump::PacketProtocol::MIDI_2_0);
+
+        if (! newConnection.isAlive())
+            return false;
+
+        newConnection.addConsumer (midi2Adapter);
+        midi2Connection = std::move (newConnection);
+        return true;
+    }
+
+    void closeMidi2Connection()
+    {
+        if (! midi2Connection.has_value())
             return;
 
-        for (const auto& view : makeRange (b, e))
-        {
-            if (ump::Utils::getGroup (view[0]) != group)
-                continue;
-
-            converter.convert (view, time, [this] (ump::BytesOnGroup v, double t)
-            {
-                const MidiMessage msg { v.bytes.data(), (int) v.bytes.size(), t };
-
-                callbacks.call ([&] (MidiInputCallback& l)
-                {
-                    l.handleIncomingMidiMessage (owner, msg);
-                });
-            });
-        }
+        midi2Connection->removeConsumer (midi2Adapter);
+        midi2Connection.reset();
     }
 
     void disconnected() override
@@ -202,15 +389,16 @@ private:
     std::shared_ptr<ump::Session> session;
     ump::LegacyVirtualInput virtualEndpoint;
     std::optional<String> customName;
-    ump::Input connection;
     MidiDeviceInfo storedInfo;
-    ump::ToBytestreamConverter converter { 4096 };
     ListenerList<DisconnectionListener> disconnectionListeners;
     WaitFreeListeners<MidiInputCallback> callbacks;
     uint8_t group{};
-    MidiInput* owner = nullptr;
-    SpinLock spinLock;
-    bool active = false;
+    MidiInputConnectionAdapter midi1Adapter, midi2Adapter;
+
+    // The connections are declared after the adapters attached to them, so that they are
+    // destroyed first
+    ump::Input connection;
+    std::optional<ump::Input> midi2Connection;
 };
 
 MidiInput::MidiInput() = default;
@@ -345,6 +533,16 @@ void MidiInput::addCallback (MidiInputCallback& callback)
 void MidiInput::removeCallback (MidiInputCallback& callback)
 {
     pimpl->removeCallback (callback);
+}
+
+bool MidiInput::addConsumer (ump::Consumer& consumer, ump::PacketProtocol wanted)
+{
+    return pimpl->addConsumer (consumer, wanted);
+}
+
+void MidiInput::removeConsumer (ump::Consumer& consumer)
+{
+    pimpl->removeConsumer (consumer);
 }
 
 void MidiInput::addDisconnectionListener (ump::DisconnectionListener& l)
